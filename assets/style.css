@@ -91,7 +91,9 @@ code, time, .num { font-family: var(--mono); font-size: 0.86em; }
 .skip:focus { top: 12px; }
 
 /* -- shell: sentence on the left, data on the right -------------------- */
-.page { display: grid; grid-template-columns: 380px minmax(0, 1fr); min-height: 100vh; }
+/* Past ~1500px the data column would stretch into lines too long to scan, so the whole page stops growing and sits in the middle. */
+.page { display: grid; grid-template-columns: 380px minmax(0, 1fr); min-height: 100vh; max-width: 1500px; margin: 0 auto; border-left: 1px solid var(--hair); border-right: 1px solid var(--hair); }
+@media (max-width: 1500px) { .page { border-left: 0; border-right: 0; } }
 .side {
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
   display: flex; flex-direction: column;
