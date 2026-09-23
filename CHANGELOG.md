@@ -2,6 +2,10 @@
 
 ## 0.1.0 (2026-09-23)
 
+First public version. HTTP, TCP, systemd, Docker, resource and heartbeat
+checks, incidents with a timeline, maintenance windows, alerts to Telegram or
+a webhook, a daily summary, and a status page with 90 days of history.
+
 
 ### Features
 
