@@ -1,6 +1,6 @@
 [Unit]
 Description=dunlin uptime and server monitoring
-Documentation=https://github.com/emresimsek/dunlin
+Documentation=https://github.com/kennywillbe/dunlin
 After=network-online.target
 Wants=network-online.target
 

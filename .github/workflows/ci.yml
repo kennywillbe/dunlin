@@ -4,6 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue builds the candidate main and needs every required check
+  # to report on it, or a queued pull request never merges.
+  merge_group:
+
+permissions:
+  contents: read
+
+# A push that supersedes another on the same branch makes the older run's
+# result irrelevant; letting it finish only burns minutes and cache writes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,26 +23,57 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    # macOS is here because the systemd client is Linux-only behind
+    # cfg(target_os), and a Linux-only run never compiles the other side
+    name: fmt + clippy + tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup component add rustfmt clippy
-          rustup default stable
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # keep in sync with rust-version in Cargo.toml
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --locked
 
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test
+  docker:
+    name: container image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          # Only main writes layers. buildx never deletes what it wrote, so
+          # writing from every pull request fills the repository's 10 GB cache
+          # and GitHub starts evicting the Rust caches the other jobs need.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}

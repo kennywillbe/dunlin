@@ -2,7 +2,7 @@
 name = "dunlin"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Self-hosted uptime and server monitoring in one binary"
 license = "MIT OR Apache-2.0"
 authors = ["Emre Şimşek"]
@@ -59,4 +59,4 @@ tempfile = "3"
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-quick-xml = "0.38"
+quick-xml = "0.41"

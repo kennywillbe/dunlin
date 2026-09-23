@@ -1,0 +1,63 @@
+name: Bug report
+description: Something behaves incorrectly, or an alert did not fire
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Missed or false alerts get priority. Remove the password hash, bot
+        tokens, webhook headers and heartbeat tokens before pasting anything.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest set of steps that shows the problem.
+      placeholder: |
+        1. Config as below
+        2. Stop the service the check points at
+        3. The status page still shows …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: dunlin version
+      placeholder: "output of `dunlin --version`, or a commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: How it runs
+      placeholder: "release binary on Debian 12 under systemd, or the container image on Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your TOML, with secrets removed.
+      render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output with `RUST_LOG=debug`, secrets removed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: "`dunlin check-config` passes, or its error is the bug I am reporting"
+        - label: I removed all secrets from everything I pasted
+          required: true

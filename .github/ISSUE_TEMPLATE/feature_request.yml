@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose a check type, a notifier or another capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        dunlin is one binary with a SQLite database. If a proposal needs an
+        external database or an agent on every host, say why it is worth that.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should dunlin do? A config sketch helps.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds, other tools, and why they fall short.

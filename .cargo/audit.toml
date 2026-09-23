@@ -1,0 +1,11 @@
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
+
+# RUSTSEC-2023-0071 is the Marvin attack on the `rsa` crate, a timing side
+# channel in RSA decryption. There is no fixed release.
+#
+# rsa is in Cargo.lock only because sqlx-mysql is: sqlx's macro crate lists
+# every database driver as an optional dependency, and the lockfile records
+# them all. dunlin enables only the sqlite feature, so `cargo tree -i rsa
+# --target all` prints nothing and rsa is never compiled into the binary.
+# Revisit if a MySQL or Postgres feature is ever turned on.
