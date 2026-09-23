@@ -24,13 +24,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Runner images are pinned, not `-latest`, so an image migration
+          # (ubuntu-latest moves to 26.04 in October 2026) is a reviewed change
+          # here instead of a surprise in the middle of a release.
+          #
           # musl so one Linux binary runs on any distribution, glibc version
           # or not; SQLite is bundled and TLS is rustls, so nothing links to
           # the host
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -79,7 +83,7 @@ jobs:
   # every upload has finished.
   notes:
     name: release notes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs: binaries
     permissions:
@@ -91,7 +95,7 @@ jobs:
 
   image:
     name: container image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # arm64 is built under QEMU emulation, which is several times slower than
     # the native amd64 build
     timeout-minutes: 180
