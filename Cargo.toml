@@ -1,0 +1,62 @@
+[package]
+name = "dunlin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Self-hosted uptime and server monitoring in one binary"
+license = "MIT OR Apache-2.0"
+authors = ["Emre Şimşek"]
+repository = "https://github.com/emresimsek/dunlin"
+readme = "README.md"
+
+[lib]
+name = "dunlin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dunlin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+askama = "0.16"
+async-trait = "0.1"
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["cookie"] }
+bollard = "0.18"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+futures-util = "0.3"
+hex = "0.4"
+notify = "8"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+time = "0.3"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+x509-parser = "0.16"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["fs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+
+[dev-dependencies]
+tempfile = "3"
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+quick-xml = "0.38"

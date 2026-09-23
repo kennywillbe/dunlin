@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">
+  <span class="state {{ impact_class }}"><span class="dot"></span>{{ impact_label }}</span>
+  · {{ component }} · {{ state_label }} · opened {{ created }}
+  {% if has_resolved %}· resolved {{ resolved }}{% endif %}
+  {% if auto %}· opened automatically{% endif %}
+</p>
+
+<h2>Timeline</h2>
+<ul class="timeline">
+  {% for u in updates %}
+  <li>
+    <div><strong>{{ u.state_label }}</strong> <span class="muted small">{{ u.ts }}</span></div>
+    <div>{{ u.message }}</div>
+  </li>
+  {% endfor %}
+</ul>
+
+{% if logged_in %}
+<h2>Add update</h2>
+<div class="card">
+  <form method="post" action="/incidents/{{ id }}/updates" class="stack">
+    <label>State
+      <select name="state">
+        <option value="investigating">Investigating</option>
+        <option value="identified">Identified</option>
+        <option value="monitoring">Monitoring</option>
+        <option value="resolved">Resolved</option>
+      </select>
+    </label>
+    <label>Message<textarea name="message" rows="3" required></textarea></label>
+    <button class="primary" type="submit">Add update</button>
+  </form>
+</div>
+<div class="card">
+  <form method="post" action="/incidents/{{ id }}/resolve">
+    <button class="primary" type="submit">Resolve incident</button>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

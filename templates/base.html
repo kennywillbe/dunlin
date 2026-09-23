@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Status{% endblock %} · dunlin</title>
+<link rel="stylesheet" href="/assets/style.css">
+<link rel="stylesheet" href="/assets/uplot.css">
+<link rel="alternate" type="application/atom+xml" title="dunlin incidents" href="/feed.xml">
+<script src="/assets/htmx.min.js" defer></script>
+</head>
+<body>
+<header class="site-header">
+  <nav hx-boost="true">
+    <a class="brand" href="/">dunlin</a>
+    <a href="/metrics">Metrics</a>
+    <a href="/incidents">Incidents</a>
+    <span class="spacer"></span>
+    {% if logged_in %}
+    <form method="post" action="/logout" class="inline" hx-boost="false"><button type="submit">Log out</button></form>
+    {% else %}
+    <a href="/login">Log in</a>
+    {% endif %}
+  </nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer>
+  <span>dunlin</span> · <a href="/health">health</a> · <a href="/feed.xml">Atom feed</a>
+</footer>
+</body>
+</html>

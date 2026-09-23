@@ -1,0 +1,30 @@
+# dunlin in Docker mode.
+#
+# Mount the host /proc read-only as /host/proc and set proc_root = "/host/proc"
+# in the config. The Docker socket and the system D-Bus socket are optional.
+#
+#   docker compose -f docker-compose.example.yml up -d
+#
+services:
+  dunlin:
+    build: .
+    image: dunlin:latest
+    restart: unless-stopped
+    command: ["--config", "/etc/dunlin/dunlin.toml"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./dunlin.toml:/etc/dunlin/dunlin.toml:ro
+      - dunlin-data:/var/lib/dunlin
+      # Host metrics: /host/proc must match proc_root in the config.
+      - /proc:/host/proc:ro
+      # Container metrics and docker checks (optional).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # systemd unit state (optional; must match the host systemd).
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+    # Reading another user's /proc entries and the Docker socket may need these.
+    group_add:
+      - docker
+
+volumes:
+  dunlin-data:

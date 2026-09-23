@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Incidents{% endblock %}
+{% block content %}
+<h1>Incidents</h1>
+{% if incidents.is_empty() %}
+<p class="muted">No incidents recorded.</p>
+{% else %}
+{% for inc in incidents %}
+<div class="card">
+  <div class="incident-title"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></div>
+  <div class="small muted">
+    <span class="state {{ inc.impact_class }}"><span class="dot"></span>{{ inc.impact_label }}</span>
+    · {{ inc.component }} · {{ inc.state_label }} · {{ inc.created }}
+    {% if inc.auto %}· automatic{% endif %}
+  </div>
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

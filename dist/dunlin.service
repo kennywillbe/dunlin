@@ -1,0 +1,42 @@
+[Unit]
+Description=dunlin uptime and server monitoring
+Documentation=https://github.com/emresimsek/dunlin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dunlin
+Group=dunlin
+# The docker group must exist (the Docker package creates it). Remove this line
+# when dunlin does not talk to Docker.
+SupplementaryGroups=docker
+ExecStart=/usr/local/bin/dunlin --config /etc/dunlin/dunlin.toml
+WorkingDirectory=/var/lib/dunlin
+StateDirectory=dunlin
+Restart=on-failure
+RestartSec=5s
+
+# Hardening. /proc stays readable for the collector; the only writable path is
+# the state directory holding the SQLite database.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/dunlin
+ReadOnlyPaths=/proc /etc/dunlin
+
+[Install]
+WantedBy=multi-user.target

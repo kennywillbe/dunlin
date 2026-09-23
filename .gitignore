@@ -1,0 +1,11 @@
+/target/
+*.log
+.env
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+
+# Local config and state.
+/dunlin.toml
+/data/

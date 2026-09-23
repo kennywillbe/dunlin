@@ -1,0 +1,7 @@
+target
+.git
+.gitignore
+data
+*.db
+*.db-shm
+*.db-wal

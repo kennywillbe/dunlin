@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>dunlin incidents</title>
+  <id>{{ feed_id }}</id>
+  <link href="{{ feed_url }}" rel="alternate"/>
+  <link href="{{ feed_url }}" rel="self"/>
+  <updated>{{ updated }}</updated>
+  <author><name>dunlin</name></author>
+  {% for e in entries %}
+  <entry>
+    <title>{{ e.title }}</title>
+    <id>{{ e.id }}</id>
+    <link href="{{ e.url }}"/>
+    <updated>{{ e.updated }}</updated>
+    <published>{{ e.published }}</published>
+    <content type="html">{{ e.content }}</content>
+  </entry>
+  {% endfor %}
+</feed>

@@ -1,0 +1,186 @@
+# dunlin example configuration.
+#
+# Copy to dunlin.toml and edit. Every key is optional unless marked required.
+# The file is reloaded automatically when it changes; an invalid new file is
+# logged and the running configuration is kept.
+
+# Address the web UI and API listen on. Required.
+listen = "127.0.0.1:8080"
+
+# Directory for the SQLite database. The DB is created as <data_dir>/dunlin.db.
+# Default: "data"
+data_dir = "data"
+
+# Explicit SQLite file path (overrides data_dir). Optional.
+# db_path = "/var/lib/dunlin/dunlin.db"
+
+# Root of the proc filesystem. Use /host/proc inside Docker.
+# Default: "/proc"
+proc_root = "/proc"
+
+# Trust X-Forwarded-For / X-Real-IP for the client address. Only enable this
+# when dunlin is behind a reverse proxy you control.
+# Default: false
+trusted_proxy = false
+
+# Mark the session cookie Secure (only when serving over HTTPS).
+# Default: false
+secure_cookies = false
+
+[web]
+# Require the password for the read-only pages as well.
+# Default: false
+protect_read = false
+
+# argon2 PHC hash of the write password. Required.
+# Generate it with:  dunlin hash-password
+# (password must be at least 12 characters). The hash below is for the
+# throwaway password "changemechangeme" and MUST be replaced.
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$HAxHiOcZJRfd5p0TbNMaUA$WaS5hjKfMZye0zcHnrwWqsUu3nWHgBWqzO/9D46dUYo"
+
+[retention]
+# Keep raw per-minute samples for this many days. Default: 7
+raw_days = 7
+# Keep hourly aggregates for this many days. Default: 90
+hourly_days = 90
+
+# Daily summary message (also proves dunlin is running). Optional; omit to
+# disable. Sent once per local day at `time`.
+[summary]
+time = "09:00"
+timezone = "Europe/Berlin"
+
+[docker]
+# Collect container metrics and enable docker checks. Default: false
+enabled = false
+# Docker socket path. Defaults to the local daemon's socket.
+# socket = "/var/run/docker.sock"
+
+[systemd]
+# Query unit state over the system D-Bus. Default: true on Linux, false elsewhere.
+enabled = true
+
+# Notification channels. Add zero or more. Both types may be repeated.
+[[notifiers]]
+type = "telegram"
+token = "123456:REPLACE"
+chat_id = "-1001234567890"
+
+[[notifiers]]
+type = "webhook"
+url = "https://example.org/dunlin-hook"
+# Optional HTTP headers sent with every webhook.
+[notifiers.headers]
+Authorization = "Bearer REPLACE"
+
+# Groups organise components on the status page.
+[[groups]]
+id = "core"
+name = "Core services"
+
+# A component is what users see. Each component may reference one check.
+# `group` is optional; components without a group are shown under "Other".
+[[components]]
+id = "homepage"
+name = "Homepage"
+group = "core"
+check = "homepage-http"
+description = "Public website"
+
+[[components]]
+id = "db"
+name = "Database host"
+group = "core"
+check = "db-resources"
+
+# --- Checks -----------------------------------------------------------------
+# Common fields for every check:
+#   interval             how often to probe (default 60s)
+#   timeout              per-probe timeout (default 10s HTTP, 5s TCP)
+#   failures_to_open     consecutive failures before an incident opens (default 3)
+#   successes_to_resolve consecutive successes before it resolves (default 2)
+#   reminder_interval    how often to remind while down (default 1h)
+# Durations accept "30s", "5m", "1h30m", "7d" or a bare number of seconds.
+
+[[checks]]
+id = "homepage-http"
+name = "Homepage"
+type = "http"
+url = "https://example.org/"
+interval = "30s"
+timeout = "5s"
+# Allowed status codes. Default: 200-399.
+expected_status = [200, 301, 302]
+# Warn when the response is slower than this.
+latency_degraded = "1s"
+# Require this substring in the response body. Optional.
+body_contains = "Welcome"
+# Warn when the TLS certificate has fewer days left than this.
+cert_days_warn = 14
+
+[[checks]]
+id = "smtp-tcp"
+name = "SMTP"
+type = "tcp"
+host = "mail.example.org"
+port = 25
+interval = "60s"
+
+[[checks]]
+id = "nginx-unit"
+name = "nginx"
+type = "systemd"
+unit = "nginx.service"
+interval = "60s"
+# Expected ActiveState values. Default: ["active"].
+expected_active = ["active"]
+
+[[checks]]
+id = "api-container"
+name = "API container"
+type = "docker"
+container = "api"
+interval = "60s"
+# Fail when the container has restarted more than this many times.
+restart_limit = 5
+
+[[checks]]
+id = "root-disk"
+name = "Root disk"
+type = "disk"
+mount = "/"
+# Warn at or above warn, fail at or above critical. Percentages.
+warn = 80.0
+critical = 90.0
+
+[[checks]]
+id = "db-resources"
+name = "Database RAM"
+type = "ram"
+warn = 85.0
+critical = 95.0
+
+[[checks]]
+id = "swap"
+name = "Swap"
+type = "swap"
+warn = 25.0
+critical = 50.0
+
+[[checks]]
+id = "load"
+name = "Load (1m)"
+type = "load"
+warn = 4.0
+critical = 8.0
+
+# Heartbeat (cron / dead-man) checks: the job pings
+#   curl -fsS -X POST https://dunlin.example.org/hb/<token>
+# and the check fails when nothing arrives within period + grace.
+[[checks]]
+id = "backup"
+name = "Nightly backup"
+type = "heartbeat"
+period = "24h"
+grace = "30m"
+token = "REPLACE_WITH_A_LONG_RANDOM_TOKEN"
