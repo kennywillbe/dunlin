@@ -1,19 +1,31 @@
 {% extends "base.html" %}
-{% block title %}Incidents{% endblock %}
+{% block title %}Incidents · {% endblock %}
 {% block content %}
-<h1>Incidents</h1>
-{% if incidents.is_empty() %}
-<p class="muted">No incidents recorded.</p>
-{% else %}
-{% for inc in incidents %}
-<div class="card">
-  <div class="incident-title"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></div>
-  <div class="small muted">
-    <span class="state {{ inc.impact_class }}"><span class="dot"></span>{{ inc.impact_label }}</span>
-    · {{ inc.component }} · {{ inc.state_label }} · {{ inc.created }}
-    {% if inc.auto %}· automatic{% endif %}
-  </div>
+<div class="page-head">
+  <h1 class="page-title">Incident history</h1>
+  <a class="util-link" href="/feed.xml">{{ site.feed_icon|safe }}Subscribe</a>
 </div>
-{% endfor %}
+{% if months.is_empty() %}
+<div class="panel empty-panel"><p>No incidents recorded.</p></div>
 {% endif %}
+{% for month in months %}
+<section class="month">
+  <h2 class="section-title">{{ month.name }}</h2>
+  <ul class="incident-list">
+    {% for inc in month.incidents %}
+    <li class="incident-row s-{{ inc.impact_class }}">
+      <a class="row-title" href="/incidents/{{ inc.id }}">{{ inc.title }}</a>
+      <span class="row-state">{% if inc.resolved.is_some() %}Resolved{% else %}{{ inc.state_label }}{% endif %}</span>
+      <p class="row-meta">
+        <span class="t-{{ inc.impact_class }}">{{ inc.impact_label }}</span> · {{ inc.component }}{% if inc.auto %} · automatic{% endif %}
+      </p>
+      <p class="row-meta num">
+        <time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time>
+        {% if let Some(r) = inc.resolved %}→ <time datetime="{{ r.iso }}" data-local="datetime">{{ r.text }}</time> · {{ inc.duration }}{% else %}· ongoing{% endif %}
+      </p>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endfor %}
 {% endblock %}

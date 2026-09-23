@@ -16,6 +16,12 @@ use tower::ServiceExt;
 const PASSWORD: &str = "correcthorsebattery";
 
 fn test_config(protect_read: bool) -> Arc<Config> {
+    test_config_with(protect_read, "", std::path::Path::new("."))
+}
+
+/// `extra` is appended to the base TOML (e.g. a `[theme]` table); relative
+/// theme paths resolve against `base`.
+fn test_config_with(protect_read: bool, extra: &str, base: &std::path::Path) -> Arc<Config> {
     let hash = dunlin::auth::hash_password(PASSWORD).unwrap();
     let toml = format!(
         r#"
@@ -48,14 +54,20 @@ id = "web"
 name = "Website"
 group = "g"
 check = "c1"
+
+{extra}
 "#
     );
-    Arc::new(config::parse_str(&toml).unwrap())
+    Arc::new(config::parse_str_at(&toml, base).unwrap())
 }
 
 async fn state(protect_read: bool) -> (AppState, Pool) {
+    state_from(test_config(protect_read)).await
+}
+
+async fn state_from(cfg: Arc<Config>) -> (AppState, Pool) {
     let pool = db::connect_memory().await.unwrap();
-    let (state, _tx) = AppState::new(pool.clone(), test_config(protect_read));
+    let (state, _tx) = AppState::new(pool.clone(), cfg);
     (state, pool)
 }
 
@@ -144,6 +156,10 @@ async fn read_pages_are_public() {
         "/assets/htmx.min.js".to_string(),
         "/assets/uplot.js".to_string(),
         "/assets/uplot.css".to_string(),
+        "/assets/dunlin.js".to_string(),
+        "/assets/metrics.js".to_string(),
+        "/assets/favicon.svg".to_string(),
+        "/metrics?range=7d".to_string(),
     ] {
         let (status, _, _) = send(app.clone(), get(&uri)).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
@@ -329,12 +345,21 @@ async fn start_and_end_maintenance_window() {
     let active = db::active_maintenance(&pool, now).await.unwrap();
     assert_eq!(active.len(), 1);
 
-    // The component is shown as under maintenance for logged-in operators.
-    let mut page = get("/");
+    // The component is shown as under maintenance on the public page...
+    let (status, _, body) = send(app.clone(), get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Under maintenance"), "{body}");
+    assert!(body.contains("Maintenance in progress"), "{body}");
+    assert!(
+        !body.contains("/maintenance/"),
+        "write controls leaked to /"
+    );
+
+    // ...and the end control lives on the operator page.
+    let mut page = get("/manage");
     page.headers_mut().insert(COOKIE, cookie.parse().unwrap());
     let (status, _, body) = send(app.clone(), page).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Under maintenance"), "{body}");
     assert!(body.contains("/maintenance/"), "end control missing");
 
     let mut end = post_form(&format!("/maintenance/{}/end", active[0].id), "");
@@ -412,4 +437,311 @@ async fn feed_is_valid_atom() {
         "title should be escaped: {body}"
     );
     assert!(!body.contains("Bad & worse"));
+}
+
+#[tokio::test]
+async fn manage_requires_login() {
+    let (state, _pool) = state(false).await;
+    let app = app(state);
+    let (status, headers, _) = send(app.clone(), get("/manage")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers.get("location").unwrap(), "/login");
+
+    let cookie = login(&app).await;
+    let mut req = get("/manage");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, body) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    for action in [
+        "action=\"/incidents\"",
+        "action=\"/maintenance\"",
+        "name=\"duration_minutes\"",
+        "name=\"component\"",
+        "name=\"title\"",
+    ] {
+        assert!(body.contains(action), "{action} missing");
+    }
+}
+
+#[tokio::test]
+async fn write_forms_are_not_on_the_status_page() {
+    let (state, _pool) = state(false).await;
+    let app = app(state);
+    let cookie = login(&app).await;
+    let mut req = get("/");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, body) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("action=\"/incidents\""));
+    assert!(!body.contains("action=\"/maintenance\""));
+    assert!(
+        body.contains("href=\"/manage\""),
+        "manage link for operators"
+    );
+
+    let (_, _, body) = send(app, get("/")).await;
+    assert!(!body.contains("href=\"/manage\""));
+    assert!(body.contains("href=\"/login\""));
+}
+
+#[tokio::test]
+async fn status_page_structure() {
+    let (state, pool) = state(false).await;
+    let now = dunlin::now_ts();
+    dunlin::db::insert_check_result(
+        &pool,
+        &dunlin::models::CheckResult {
+            ts: now - 60,
+            check_id: "c1".into(),
+            ok: true,
+            degraded: false,
+            latency_ms: Some(3.0),
+            message: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::create_incident(
+        &pool,
+        "web",
+        "Slow pages",
+        dunlin::models::State::Degraded,
+        dunlin::models::IncidentState::Investigating,
+        false,
+        now - 120,
+    )
+    .await
+    .unwrap();
+    let app = app(state);
+    let (status, _, body) = send(app, get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.matches("class=\"bar ").count(),
+        90,
+        "one strip of 90 days"
+    );
+    assert!(body.contains("100.00% uptime"), "legend uptime");
+    assert!(body.contains("Past incidents"));
+    assert_eq!(body.matches("class=\"day\"").count(), 14);
+    assert!(body.contains("No incidents reported."));
+    assert!(body.contains("Slow pages"));
+    assert!(
+        body.contains("Degraded performance"),
+        "banner follows the worst state"
+    );
+}
+
+#[tokio::test]
+async fn incident_page_renders_timeline_newest_first() {
+    use dunlin::models::{IncidentState, State};
+    let (state, pool) = state(false).await;
+    let id = db::create_incident(
+        &pool,
+        "web",
+        "Outage",
+        State::MajorOutage,
+        IncidentState::Investigating,
+        false,
+        100,
+    )
+    .await
+    .unwrap();
+    db::add_update(
+        &pool,
+        id,
+        100,
+        IncidentState::Investigating,
+        "first note",
+        false,
+    )
+    .await
+    .unwrap();
+    db::add_update(
+        &pool,
+        id,
+        200,
+        IncidentState::Identified,
+        "second note",
+        false,
+    )
+    .await
+    .unwrap();
+    let app = app(state);
+    let (status, _, body) = send(app.clone(), get(&format!("/incidents/{id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (first, second) = (
+        body.find("second note").unwrap(),
+        body.find("first note").unwrap(),
+    );
+    assert!(first < second, "newest update first");
+    assert!(body.contains("Website"), "component shown by name");
+    assert!(!body.contains("/resolve"), "no write form for visitors");
+
+    let (status, _, body) = send(app.clone(), get("/incidents/99999")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("Incident not found"));
+
+    let (status, _, body) = send(app.clone(), get("/incidents")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("January 1970"), "grouped by month");
+}
+
+#[tokio::test]
+async fn unknown_page_is_a_designed_404() {
+    let (state, _pool) = state(false).await;
+    let app = app(state);
+    let (status, headers, body) = send(app.clone(), get("/no/such/page")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(headers
+        .get(CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(body.contains("Page not found"));
+    let (status, _, _) = send(app, get("/assets/nope.js")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn metrics_api_returns_series_and_summary() {
+    let (state, pool) = state(false).await;
+    let now = dunlin::now_ts();
+    let samples: Vec<dunlin::models::Sample> = [10.0, 30.0, 20.0]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| dunlin::models::Sample {
+            ts: now - 300 + i as i64 * 60,
+            scope: "host".into(),
+            metric: "cpu_pct".into(),
+            key: String::new(),
+            value: *v,
+        })
+        .collect();
+    db::insert_samples(&pool, &samples).await.unwrap();
+    let app = app(state);
+    let (status, _, body) = send(
+        app.clone(),
+        get("/api/metrics?scope=host&metric=cpu_pct&key=&range=24h"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["unit"], "%");
+    assert_eq!(v["points"], 3);
+    assert_eq!(v["t"].as_array().unwrap().len(), 3);
+    assert_eq!(v["v"][1], 30.0);
+    assert_eq!(v["last"], 20.0);
+    assert_eq!(v["max"], 30.0);
+    assert_eq!(v["avg"], 20.0);
+
+    // An empty series still has the full shape, with null summaries.
+    let (_, _, body) = send(
+        app.clone(),
+        get("/api/metrics?scope=host&metric=swap_pct&range=7d"),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["points"], 0);
+    assert!(v["last"].is_null() && v["avg"].is_null() && v["max"].is_null());
+
+    let (_, _, body) = send(app, get("/metrics")).await;
+    assert!(body.contains("id=\"chart-cards\""));
+    assert!(
+        body.contains("\"metric\":\"latency_ms\",\"key\":\"c1\""),
+        "check latency card"
+    );
+    assert!(body.contains("\"metric\":\"cpu_pct\""));
+}
+
+#[tokio::test]
+async fn favicon_and_default_theme() {
+    let (state, _pool) = state(false).await;
+    let app = app(state);
+    let (status, headers, body) = send(app.clone(), get("/assets/favicon.svg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "image/svg+xml");
+    assert!(body.contains("#0f6f73"));
+
+    let (_, _, body) = send(app.clone(), get("/")).await;
+    assert!(body.contains("<html lang=\"en\" data-theme=\"auto\">"));
+    assert!(body.contains("<title>Status</title>"));
+    assert!(body.contains("--accent:#0f6f73"));
+    assert!(!body.contains("/assets/custom.css"));
+    assert!(!body.contains("/assets/logo"));
+
+    // Nothing configured, so nothing served.
+    let (status, _, _) = send(app.clone(), get("/assets/custom.css")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = send(app, get("/assets/logo")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn configured_theme_applies_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("brand.png"), b"\x89PNG fake").unwrap();
+    std::fs::write(dir.path().join("brand.css"), ".banner{border-width:2px}").unwrap();
+    let cfg = test_config_with(
+        false,
+        "[theme]\ntitle = \"Acme status\"\naccent = \"#7a3cff\"\nmode = \"dark\"\nlogo = \"brand.png\"\ncustom_css = \"brand.css\"\n",
+        dir.path(),
+    );
+    let (state, _pool) = state_from(cfg).await;
+    let app = app(state);
+
+    for uri in ["/", "/metrics", "/incidents", "/login", "/nope"] {
+        let (_, _, body) = send(app.clone(), get(uri)).await;
+        assert!(body.contains("data-theme=\"dark\""), "{uri}");
+        assert!(body.contains("Acme status</title>"), "{uri}");
+        assert!(body.contains("class=\"brand-title\">Acme status<"), "{uri}");
+        assert!(body.contains("href=\"/assets/custom.css\""), "{uri}");
+        assert!(body.contains("src=\"/assets/logo\""), "{uri}");
+        assert!(body.contains("--accent:#7a3cff"), "{uri}");
+    }
+
+    let (status, headers, body) = send(app.clone(), get("/assets/custom.css")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers
+        .get(CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/css"));
+    assert_eq!(body, ".banner{border-width:2px}");
+
+    let (status, headers, _) = send(app.clone(), get("/assets/logo")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "image/png");
+    assert!(headers.get("content-security-policy").is_some());
+
+    let (_, _, body) = send(app, get("/feed.xml")).await;
+    assert!(body.contains("<title>Acme status incidents</title>"));
+}
+
+#[tokio::test]
+async fn theme_follows_hot_reload() {
+    let pool = db::connect_memory().await.unwrap();
+    let (state, tx) = AppState::new(pool, test_config(false));
+    let app = app(state);
+    let (_, _, body) = send(app.clone(), get("/")).await;
+    assert!(body.contains("<title>Status</title>"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dunlin.toml");
+    std::fs::write(dir.path().join("x.css"), "body{}").unwrap();
+    let hash = dunlin::auth::hash_password(PASSWORD).unwrap();
+    std::fs::write(
+        &path,
+        format!("listen = \"127.0.0.1:0\"\n[web]\npassword_hash = \"{hash}\"\n[theme]\ntitle = \"Renamed\"\nmode = \"light\"\ncustom_css = \"x.css\"\n"),
+    )
+    .unwrap();
+    dunlin::app::apply_reload(&path, &tx);
+
+    let (_, _, body) = send(app.clone(), get("/")).await;
+    assert!(body.contains("<title>Renamed</title>"));
+    assert!(body.contains("data-theme=\"light\""));
+    let (status, _, body) = send(app, get("/assets/custom.css")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "body{}");
 }

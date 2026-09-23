@@ -22,12 +22,28 @@ use crate::systemd::{configured_units, unit_samples, SystemdSource};
 use crate::web::{self, AppState};
 
 /// Actor that keeps the config-reload notification stream alive.
+///
+/// Besides the config file it watches the theme's logo and custom CSS, so a
+/// stylesheet edit shows up without touching the config. Theme files added
+/// later in a new directory are picked up on the next config edit, not live.
 pub fn spawn_config_watcher(path: PathBuf, tx: watch::Sender<Arc<Config>>) -> Result<()> {
+    // notify reports absolute paths, so a relative `--config dunlin.toml`
+    // would never compare equal without canonicalising first.
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    let mut dirs = vec![parent];
+    for file in &tx.borrow().theme_files.paths {
+        let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+        if let Some(dir) = file.parent() {
+            if !dirs.iter().any(|d| d == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+    }
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("config-watch".to_string())
@@ -41,14 +57,27 @@ pub fn spawn_config_watcher(path: PathBuf, tx: watch::Sender<Arc<Config>>) -> Re
                     return;
                 }
             };
-            if let Err(e) = watcher.watch(&parent, notify::RecursiveMode::NonRecursive) {
-                tracing::error!(error = %e, dir = %parent.display(), "cannot watch config directory");
-                return;
+            for dir in &dirs {
+                if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+                    tracing::error!(error = %e, dir = %dir.display(), "cannot watch config directory");
+                    return;
+                }
             }
             for res in event_rx {
                 match res {
                     Ok(event) => {
-                        if event.paths.iter().any(|p| p == &path) {
+                        let theme: Vec<PathBuf> = tx
+                            .borrow()
+                            .theme_files
+                            .paths
+                            .iter()
+                            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+                            .collect();
+                        let relevant = event.paths.iter().any(|p| {
+                            let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                            p == path || theme.contains(&p)
+                        });
+                        if relevant {
                             apply_reload(&path, &tx);
                         }
                     }

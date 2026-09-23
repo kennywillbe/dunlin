@@ -1,54 +1,40 @@
 {% extends "base.html" %}
-{% block title %}Metrics{% endblock %}
+{% block title %}Metrics · {% endblock %}
+{% block head %}<link rel="stylesheet" href="/assets/uplot.css">{% endblock %}
 {% block content %}
-<h1>Metrics</h1>
-<div class="chart-controls">
-  <label>Series
-    <select id="series">
-      {% for s in series %}<option value="{{ s.index }}">{{ s.label }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Range
-    <select id="range">
-      <option value="24h" selected>24 hours</option>
-      <option value="7d">7 days</option>
-      <option value="90d">90 days</option>
-    </select>
-  </label>
+<div class="page-head">
+  <h1 class="page-title">Metrics</h1>
+  <nav class="segmented" aria-label="Time range">
+    <a href="?range=24h" data-range="24h"{% if range == "24h" %} aria-current="true"{% endif %}>24 hours</a>
+    <a href="?range=7d" data-range="7d"{% if range == "7d" %} aria-current="true"{% endif %}>7 days</a>
+    <a href="?range=90d" data-range="90d"{% if range == "90d" %} aria-current="true"{% endif %}>90 days</a>
+  </nav>
 </div>
-<div id="chart" class="chart"></div>
-<p class="muted small" id="chart-note"></p>
 
+{% for section in sections %}
+<section class="metric-section" aria-labelledby="sec-{{ loop.index }}">
+  <h2 id="sec-{{ loop.index }}" class="section-title">{{ section.title }}</h2>
+  {% if section.cards.is_empty() %}
+  <p class="muted">{{ section.empty_note }}</p>
+  {% else %}
+  <div class="chart-grid">
+    {% for card in section.cards %}
+    <article class="panel chart-card" id="{{ card.id }}">
+      <header class="chart-head">
+        <h3 class="chart-title">{{ card.title }}</h3>
+        <p class="chart-value num" data-role="value">–</p>
+      </header>
+      <p class="chart-sub num" data-role="sub">&nbsp;</p>
+      <div class="chart-body" data-role="chart"><p class="chart-empty" data-role="empty">Loading…</p></div>
+    </article>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+{% endfor %}
+{% endblock %}
+{% block scripts %}
+<script id="chart-cards" type="application/json">{{ cards_json|safe }}</script>
 <script src="/assets/uplot.js"></script>
-<script>
-  var SERIES = {{ series_json|safe }};
-  var chart = null;
-
-  function load() {
-    var idx = parseInt(document.getElementById("series").value, 10) || 0;
-    var s = SERIES[idx];
-    var range = document.getElementById("range").value;
-    var url = "/api/metrics?scope=" + encodeURIComponent(s.scope) +
-              "&metric=" + encodeURIComponent(s.metric) +
-              "&key=" + encodeURIComponent(s.key) +
-              "&range=" + encodeURIComponent(range);
-    fetch(url).then(function (r) { return r.json(); }).then(function (data) {
-      var note = document.getElementById("chart-note");
-      note.textContent = data.points + " points, unit: " + data.unit;
-      var opts = {
-        width: document.getElementById("chart").clientWidth || 800,
-        height: 280,
-        series: [{}, { label: s.label, stroke: "#58a6ff" }],
-        axes: [{}, { label: data.unit }]
-      };
-      if (chart) { chart.destroy(); }
-      chart = new uPlot(opts, [data.t, data.v], document.getElementById("chart"));
-    });
-  }
-
-  document.getElementById("series").addEventListener("change", load);
-  document.getElementById("range").addEventListener("change", load);
-  window.addEventListener("load", load);
-  window.addEventListener("resize", function () { if (chart) { chart.destroy(); chart = null; load(); } });
-</script>
+<script src="/assets/metrics.js"></script>
 {% endblock %}

@@ -6,7 +6,7 @@ rust-version = "1.85"
 description = "Self-hosted uptime and server monitoring in one binary"
 license = "MIT OR Apache-2.0"
 authors = ["Emre Şimşek"]
-repository = "https://github.com/emresimsek/dunlin"
+repository = "https://github.com/kennywillbe/dunlin"
 readme = "README.md"
 
 [lib]

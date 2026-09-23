@@ -38,6 +38,24 @@ protect_read = false
 # throwaway password "changemechangeme" and MUST be replaced.
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$HAxHiOcZJRfd5p0TbNMaUA$WaS5hjKfMZye0zcHnrwWqsUu3nWHgBWqzO/9D46dUYo"
 
+[theme]
+# Shown in the header, the browser tab and the feed title. Default: "Status"
+title = "Status"
+# Accent colour for links, buttons and charts, as #rrggbb. Default: "#0f6f73"
+# Link and button text is adjusted automatically if the colour is too light
+# or too dark to read in one of the modes.
+accent = "#0f6f73"
+# "auto" follows the visitor's system setting; "light" or "dark" force one.
+# Default: "auto"
+mode = "auto"
+# Optional logo shown instead of the built-in mark (.png, .svg, .jpg or .webp,
+# at most 256 KB). Relative paths are resolved from this file's directory.
+# logo = "logo.svg"
+# Optional stylesheet loaded after the built-in one (at most 256 KB). Every
+# colour is a CSS custom property on :root, e.g. --bg, --surface, --text,
+# --ok, --major. Edits are picked up without a restart.
+# custom_css = "custom.css"
+
 [retention]
 # Keep raw per-minute samples for this many days. Default: 7
 raw_days = 7

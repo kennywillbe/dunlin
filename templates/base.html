@@ -1,33 +1,51 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="{{ site.mode }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}Status{% endblock %} · dunlin</title>
+<meta name="color-scheme" content="{% if site.mode == "auto" %}light dark{% else %}{{ site.mode }}{% endif %}">
+<title>{% block title %}{% endblock %}{{ site.title }}</title>
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="stylesheet" href="/assets/style.css">
-<link rel="stylesheet" href="/assets/uplot.css">
-<link rel="alternate" type="application/atom+xml" title="dunlin incidents" href="/feed.xml">
-<script src="/assets/htmx.min.js" defer></script>
+<style>{{ site.accent_css|safe }}</style>
+{% block head %}{% endblock %}
+{% if site.has_custom_css %}<link rel="stylesheet" href="/assets/custom.css">{% endif %}
+<link rel="alternate" type="application/atom+xml" title="{{ site.title }} incidents" href="/feed.xml">
+<script src="/assets/dunlin.js" defer></script>
 </head>
 <body>
+<a class="skip" href="#main">Skip to content</a>
 <header class="site-header">
-  <nav hx-boost="true">
-    <a class="brand" href="/">dunlin</a>
-    <a href="/metrics">Metrics</a>
-    <a href="/incidents">Incidents</a>
-    <span class="spacer"></span>
-    {% if logged_in %}
-    <form method="post" action="/logout" class="inline" hx-boost="false"><button type="submit">Log out</button></form>
-    {% else %}
-    <a href="/login">Log in</a>
-    {% endif %}
-  </nav>
+  <div class="wrap header-row">
+    <a class="brand" href="/">
+      {% if site.has_logo %}<img class="brand-logo" src="/assets/logo" alt="">{% else %}{{ site.logo_svg|safe }}{% endif %}
+      <span class="brand-title">{{ site.title }}</span>
+    </a>
+    <nav class="primary" aria-label="Main">
+      <a href="/"{% if site.section == "status" %} aria-current="page"{% endif %}>Status</a>
+      <a href="/metrics"{% if site.section == "metrics" %} aria-current="page"{% endif %}>Metrics</a>
+      <a href="/incidents"{% if site.section == "incidents" %} aria-current="page"{% endif %}>Incidents</a>
+    </nav>
+    <div class="utility">
+      <a class="util-link" href="/feed.xml" title="Atom feed of incidents">{{ site.feed_icon|safe }}<span class="util-text">Feed</span></a>
+      {% if site.logged_in %}
+      <a class="util-link" href="/manage"{% if site.section == "manage" %} aria-current="page"{% endif %}>Manage</a>
+      <form method="post" action="/logout" class="inline"><button type="submit" class="link-button">Log out</button></form>
+      {% else %}
+      <a class="util-link" href="/login"{% if site.section == "login" %} aria-current="page"{% endif %}>Log in</a>
+      {% endif %}
+    </div>
+  </div>
 </header>
-<main>
+<main id="main" class="wrap">
 {% block content %}{% endblock %}
 </main>
-<footer>
-  <span>dunlin</span> · <a href="/health">health</a> · <a href="/feed.xml">Atom feed</a>
+<footer class="site-footer">
+  <div class="wrap footer-row">
+    <span>Powered by dunlin</span>
+    <span class="footer-links"><a href="/incidents">Incident history</a> · <a href="/feed.xml">Atom feed</a></span>
+  </div>
 </footer>
+{% block scripts %}{% endblock %}
 </body>
 </html>

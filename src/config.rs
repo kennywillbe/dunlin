@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -77,6 +78,137 @@ pub struct WebConfig {
     /// argon2 PHC string for the write password.
     #[serde(default)]
     pub password_hash: Option<String>,
+}
+
+/// `[theme]` light / dark / follow the browser.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::Auto => "auto",
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        }
+    }
+}
+
+/// `[theme]`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeConfig {
+    #[serde(default = "default_title")]
+    pub title: String,
+    #[serde(default = "default_accent")]
+    pub accent: String,
+    #[serde(default)]
+    pub mode: ThemeMode,
+    /// Relative paths are resolved against the config file's directory.
+    #[serde(default)]
+    pub logo: Option<PathBuf>,
+    #[serde(default)]
+    pub custom_css: Option<PathBuf>,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            title: default_title(),
+            accent: default_accent(),
+            mode: ThemeMode::Auto,
+            logo: None,
+            custom_css: None,
+        }
+    }
+}
+
+fn default_title() -> String {
+    "Status".to_string()
+}
+fn default_accent() -> String {
+    crate::theme::DEFAULT_ACCENT.to_string()
+}
+
+/// Upper bound for the logo and custom CSS files. They are held in memory and
+/// sent with every page, so anything larger is almost certainly a mistake.
+pub const THEME_FILE_MAX_BYTES: u64 = 256 * 1024;
+
+/// Logo image read at load time.
+#[derive(Debug, Clone)]
+pub struct LogoFile {
+    pub content_type: &'static str,
+    pub bytes: Arc<[u8]>,
+}
+
+/// Theme files read at load time, so a missing or oversized file fails the
+/// (re)load instead of breaking pages later.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeFiles {
+    pub logo: Option<LogoFile>,
+    pub custom_css: Option<Arc<str>>,
+    /// Resolved paths, watched for changes alongside the config file.
+    pub paths: Vec<PathBuf>,
+}
+
+fn logo_content_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => return None,
+    })
+}
+
+fn read_capped(path: &Path, what: &str) -> Result<Vec<u8>> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("theme.{what} {}: cannot read", path.display()))?;
+    if meta.len() > THEME_FILE_MAX_BYTES {
+        bail!(
+            "theme.{what} {} is {} bytes; the limit is {} KB",
+            path.display(),
+            meta.len(),
+            THEME_FILE_MAX_BYTES / 1024
+        );
+    }
+    std::fs::read(path).with_context(|| format!("theme.{what} {}: cannot read", path.display()))
+}
+
+/// Read the logo and custom CSS named in `[theme]`, relative to `base`.
+pub fn load_theme_files(theme: &ThemeConfig, base: &Path) -> Result<ThemeFiles> {
+    let mut files = ThemeFiles::default();
+    if let Some(p) = &theme.logo {
+        let path = base.join(p);
+        let content_type = logo_content_type(&path).ok_or_else(|| {
+            anyhow!(
+                "theme.logo {} must be a .png, .svg, .jpg or .webp file",
+                path.display()
+            )
+        })?;
+        let bytes = read_capped(&path, "logo")?;
+        files.logo = Some(LogoFile {
+            content_type,
+            bytes: bytes.into(),
+        });
+        files.paths.push(path);
+    }
+    if let Some(p) = &theme.custom_css {
+        let path = base.join(p);
+        let bytes = read_capped(&path, "custom_css")?;
+        let css = String::from_utf8(bytes)
+            .map_err(|_| anyhow!("theme.custom_css {} is not UTF-8", path.display()))?;
+        files.custom_css = Some(css.into());
+        files.paths.push(path);
+    }
+    Ok(files)
 }
 
 /// `[retention]`
@@ -333,6 +465,11 @@ pub struct Config {
     pub components: Vec<ComponentConfig>,
     #[serde(default)]
     pub checks: Vec<CheckConfig>,
+    #[serde(default)]
+    pub theme: ThemeConfig,
+    /// Contents of the files named in `[theme]`; filled by the loaders.
+    #[serde(skip)]
+    pub theme_files: ThemeFiles,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -360,6 +497,8 @@ impl Default for Config {
             groups: Vec::new(),
             components: Vec::new(),
             checks: Vec::new(),
+            theme: ThemeConfig::default(),
+            theme_files: ThemeFiles::default(),
         }
     }
 }
@@ -386,10 +525,18 @@ impl Config {
     }
 }
 
-/// Parse and validate a config string.
+/// Parse and validate a config string; theme files resolve against the
+/// working directory.
 pub fn parse_str(s: &str) -> Result<Config> {
-    let cfg: Config = toml::from_str(s).context("invalid TOML")?;
+    parse_str_at(s, Path::new("."))
+}
+
+/// Parse and validate a config string whose relative theme paths resolve
+/// against `base`.
+pub fn parse_str_at(s: &str, base: &Path) -> Result<Config> {
+    let mut cfg: Config = toml::from_str(s).context("invalid TOML")?;
     validate(&cfg)?;
+    cfg.theme_files = load_theme_files(&cfg.theme, base)?;
     Ok(cfg)
 }
 
@@ -397,7 +544,11 @@ pub fn parse_str(s: &str) -> Result<Config> {
 pub fn load(path: &Path) -> Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config {}", path.display()))?;
-    parse_str(&text).with_context(|| format!("config {}", path.display()))
+    let base = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    parse_str_at(&text, base).with_context(|| format!("config {}", path.display()))
 }
 
 /// Collect every validation problem before failing, so a user can fix them in
@@ -442,6 +593,14 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 errs.push("web.password_hash is not a valid argon2 PHC string".to_string());
             }
         }
+    }
+
+    if let Err(e) = crate::theme::parse_hex(&cfg.theme.accent) {
+        errs.push(format!("theme.{e}"));
+    }
+    let title = cfg.theme.title.trim();
+    if title.is_empty() || title.chars().count() > 80 {
+        errs.push("theme.title must be 1 to 80 characters".to_string());
     }
 
     let mut group_ids = HashSet::new();
@@ -685,6 +844,62 @@ check = "nope"
         assert_eq!(parse_hhmm("09:30"), Some((9, 30)));
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("9:0"), Some((9, 0)));
+    }
+
+    #[test]
+    fn theme_defaults_and_validation() {
+        let cfg = parse_str(&base_with_real_hash()).unwrap();
+        assert_eq!(cfg.theme.title, "Status");
+        assert_eq!(cfg.theme.accent, "#0f6f73");
+        assert_eq!(cfg.theme.mode, ThemeMode::Auto);
+        assert!(cfg.theme_files.logo.is_none());
+
+        for bad in ["teal", "#0f6f7", "#0f6f73;}", "#fff"] {
+            let s = format!("{}\n[theme]\naccent = \"{bad}\"\n", base_with_real_hash());
+            let err = parse_str(&s).unwrap_err().to_string();
+            assert!(err.contains("theme.accent"), "{bad}: {err}");
+        }
+        let s = format!("{}\n[theme]\nmode = \"sepia\"\n", base_with_real_hash());
+        assert!(parse_str(&s).is_err());
+        let s = format!("{}\n[theme]\ntitle = \"  \"\n", base_with_real_hash());
+        assert!(parse_str(&s).is_err());
+    }
+
+    #[test]
+    fn theme_files_are_read_relative_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("brand.svg"), "<svg/>").unwrap();
+        std::fs::write(dir.path().join("extra.css"), "body{}").unwrap();
+        let s = format!(
+            "{}\n[theme]\nlogo = \"brand.svg\"\ncustom_css = \"extra.css\"\nmode = \"dark\"\n",
+            base_with_real_hash()
+        );
+        let cfg = parse_str_at(&s, dir.path()).unwrap();
+        assert_eq!(cfg.theme.mode, ThemeMode::Dark);
+        let logo = cfg.theme_files.logo.as_ref().unwrap();
+        assert_eq!(logo.content_type, "image/svg+xml");
+        assert_eq!(&*logo.bytes, b"<svg/>");
+        assert_eq!(cfg.theme_files.custom_css.as_deref(), Some("body{}"));
+        assert_eq!(cfg.theme_files.paths.len(), 2);
+
+        // Loading from a file resolves against that file's directory.
+        let path = dir.path().join("dunlin.toml");
+        std::fs::write(&path, &s).unwrap();
+        assert!(load(&path).unwrap().theme_files.custom_css.is_some());
+
+        let big = vec![b'a'; THEME_FILE_MAX_BYTES as usize + 1];
+        std::fs::write(dir.path().join("extra.css"), &big).unwrap();
+        let err = parse_str_at(&s, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("limit"), "{err}");
+
+        let s = format!("{}\n[theme]\nlogo = \"brand.gif\"\n", base_with_real_hash());
+        std::fs::write(dir.path().join("brand.gif"), "GIF89a").unwrap();
+        assert!(parse_str_at(&s, dir.path()).is_err());
+        let s = format!(
+            "{}\n[theme]\ncustom_css = \"missing.css\"\n",
+            base_with_real_hash()
+        );
+        assert!(parse_str_at(&s, dir.path()).is_err());
     }
 
     pub(super) fn base_with_real_hash() -> String {

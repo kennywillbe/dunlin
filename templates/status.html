@@ -1,99 +1,86 @@
 {% extends "base.html" %}
-{% block title %}Status{% endblock %}
+{% block head %}<script src="/assets/htmx.min.js" defer></script>{% endblock %}
 {% block content %}
-<div class="banner {{ overall_class }}">
-  <span class="dot"></span>
-  <span class="label">{{ overall_label }}</span>
-</div>
+<div id="live" hx-get="/" hx-trigger="every 60s" hx-select="#live" hx-swap="outerHTML">
 
-{% if has_active_incidents %}
-<h2>Active incidents</h2>
+<section class="banner s-{{ overall_class }}" aria-live="polite">
+  <span class="banner-icon">{{ overall_icon|safe }}</span>
+  <h1 class="banner-label">{{ overall_label }}</h1>
+  <p class="banner-updated">Updated <time datetime="{{ updated.iso }}" data-local="time" data-zone>{{ updated.text }}</time></p>
+</section>
+
 {% for inc in active_incidents %}
-<div class="card">
-  <div class="incident-title"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></div>
-  <div class="small muted">{{ inc.component }} · {{ inc.state_label }} · since {{ inc.created }}</div>
-  {% if let Some(m) = inc.last_message %}<p>{{ m }}</p>{% endif %}
-</div>
+<article class="notice s-{{ inc.impact_class }}">
+  <div class="notice-head">
+    <h2 class="notice-title"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></h2>
+    <span class="pill">{{ inc.state_label }}</span>
+  </div>
+  {% if let Some(m) = inc.last_message %}<p class="notice-body">{{ m }}</p>{% endif %}
+  <p class="notice-meta">{{ inc.component }} · {{ inc.impact_label }} · since <time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time></p>
+</article>
 {% endfor %}
-{% endif %}
 
-<h2>Components</h2>
+{% for m in maintenance %}
+<article class="notice s-maintenance">
+  <div class="notice-head">
+    <h2 class="notice-title"><span class="notice-icon">{{ wrench_icon|safe }}</span>{% if m.active %}Maintenance in progress{% else %}Scheduled maintenance{% endif %}</h2>
+    <span class="pill">{{ m.component }}</span>
+  </div>
+  {% if !m.note.is_empty() %}<p class="notice-body">{{ m.note }}</p>{% endif %}
+  <p class="notice-meta"><time datetime="{{ m.starts.iso }}" data-local="datetime">{{ m.starts.text }}</time> to <time datetime="{{ m.ends.iso }}" data-local="datetime">{{ m.ends.text }}</time></p>
+</article>
+{% endfor %}
+
+{% if groups.is_empty() %}
+<div class="panel empty-panel">
+  <p>No components are configured yet. Add <code>[[components]]</code> to the config file.</p>
+</div>
+{% endif %}
 {% for group in groups %}
-<div class="group">
-  <h3>{{ group.name }}</h3>
+<section class="panel group" aria-label="{{ group.name }}">
+  <h2 class="group-name">{{ group.name }}</h2>
   {% for c in group.components %}
   <div class="component">
-    <div class="name">{{ c.name }}{% if let Some(d) = c.description %}<span class="desc">{{ d }}</span>{% endif %}</div>
-    <div class="bars" title="90-day uptime">
-      {% for bar in c.bars %}<span class="bar {{ bar.class }}" title="{{ bar.title }}"></span>{% endfor %}
+    <div class="component-head">
+      <h3 class="component-name">{{ c.name }}{% if let Some(d) = c.description %}
+        <button type="button" class="help" data-tip="{{ d }}" aria-label="About {{ c.name }}: {{ d }}">{{ info_icon|safe }}</button>{% endif %}</h3>
+      <span class="state-label s-{{ c.state_class }}">{{ c.state_label }}</span>
     </div>
-    <div class="uptime">{% if let Some(u) = c.uptime_90 %}{{ u }}%{% else %}—{% endif %}</div>
-    <div class="state {{ c.state_class }}"><span class="dot"></span>{{ c.state_label }}</div>
+    <div class="bars" role="group" aria-label="{{ c.name }}, uptime for the last 90 days. Use the arrow keys to move between days.">
+      {% for bar in c.bars %}<span class="bar s-{{ bar.class }}" role="img" tabindex="{% if loop.last %}0{% else %}-1{% endif %}" aria-label="{{ bar.aria }}" data-date="{{ bar.date }}" data-uptime="{{ bar.uptime }}" data-label="{{ bar.label }}"></span>{% endfor %}
+    </div>
+    <div class="bars-legend">
+      <span><span class="wide">90 days ago</span><span class="narrow">30 days ago</span></span>
+      <span class="legend-rule" aria-hidden="true"></span>
+      <span class="num">{% if let Some(u) = c.uptime_90 %}{{ u }}% uptime{% else %}No uptime data{% endif %}</span>
+      <span class="legend-rule" aria-hidden="true"></span>
+      <span>Today</span>
+    </div>
   </div>
   {% endfor %}
-</div>
+</section>
 {% endfor %}
 
-{% if !has_recent_incidents %}
-<h2>Recent incidents</h2>
-<p class="muted">No incidents recorded.</p>
-{% else %}
-<h2>Recent incidents</h2>
-{% for inc in recent_incidents %}
-<div class="component">
-  <div class="name"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></div>
-  <div class="muted small">{{ inc.created }}</div>
-  <div class="state {{ inc.impact_class }}"><span class="dot"></span>{{ inc.state_label }}</div>
-</div>
-{% endfor %}
-{% endif %}
-
-{% if logged_in %}
-<h2>Manage</h2>
-{% if !maintenance_windows.is_empty() %}
-<div class="card">
-  <h3>Active maintenance</h3>
-  {% for m in maintenance_windows %}
-  <div class="component">
-    <div class="name">{{ m.component }}{% if !m.note.is_empty() %}<span class="desc">{{ m.note }}</span>{% endif %}</div>
-    <div class="muted small">until {{ m.ends }}</div>
-    <form method="post" action="/maintenance/{{ m.id }}/end" class="inline"><button type="submit">End</button></form>
+<section class="past" aria-labelledby="past-heading">
+  <h2 id="past-heading" class="section-title">Past incidents</h2>
+  {% for day in past_days %}
+  <div class="day">
+    <h3 class="day-heading">{{ day.heading }}</h3>
+    {% if day.incidents.is_empty() %}
+    <p class="muted">No incidents reported.</p>
+    {% else %}
+    {% for inc in day.incidents %}
+    <div class="past-incident">
+      <a class="past-title t-{{ inc.impact_class }}" href="/incidents/{{ inc.id }}">{{ inc.title }}</a>
+      {% if let Some(m) = inc.last_message %}<p class="past-update"><strong>{{ inc.state_label }}</strong> · {{ m }}</p>{% endif %}
+      <p class="past-meta"><time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time>{% if inc.resolved.is_some() %} · resolved after {{ inc.duration }}{% endif %}</p>
+    </div>
+    {% endfor %}
+    {% endif %}
   </div>
   {% endfor %}
+  <p class="more"><a href="/incidents">Incident history</a></p>
+</section>
+
 </div>
-{% endif %}
-<div class="card">
-  <form method="post" action="/maintenance" class="stack">
-    <label>Maintenance component
-      <select name="component">
-        <option value="">All components</option>
-        {% for c in all_components %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
-      </select>
-    </label>
-    <label>Duration (minutes)<input type="number" name="duration_minutes" value="60" min="1"></label>
-    <label>Note<input type="text" name="note" placeholder="Planned upgrade"></label>
-    <button class="primary" type="submit">Start maintenance</button>
-  </form>
-</div>
-<div class="card">
-  <form method="post" action="/incidents" class="stack">
-    <label>Component
-      <select name="component">
-        {% for c in all_components %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
-      </select>
-    </label>
-    <label>Title<input type="text" name="title" required></label>
-    <label>State
-      <select name="state">
-        <option value="degraded">Degraded</option>
-        <option value="partial_outage">Partial outage</option>
-        <option value="major_outage">Major outage</option>
-        <option value="maintenance">Maintenance</option>
-      </select>
-    </label>
-    <label>Message<textarea name="message" rows="3"></textarea></label>
-    <button class="primary" type="submit">Create incident</button>
-  </form>
-</div>
-{% endif %}
 {% endblock %}

@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Manage · {% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1 class="page-title">Manage</h1>
+</div>
+
+<div class="manage-grid">
+  <section class="panel form-panel" aria-labelledby="new-incident">
+    <h2 id="new-incident" class="panel-title">Report an incident</h2>
+    <form method="post" action="/incidents" class="form">
+      <div class="field">
+        <label for="i-title">Title</label>
+        <input id="i-title" type="text" name="title" required placeholder="Elevated error rates on the API">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="i-component">Component</label>
+          <select id="i-component" name="component">
+            {% for c in components %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+            <option value="__all">All components</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="i-state">Impact</label>
+          <select id="i-state" name="state">
+            <option value="degraded">Degraded performance</option>
+            <option value="partial_outage">Partial outage</option>
+            <option value="major_outage">Major outage</option>
+            <option value="maintenance">Maintenance</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="i-message">First update</label>
+        <textarea id="i-message" name="message" rows="3" placeholder="We are investigating reports of..."></textarea>
+      </div>
+      <div class="actions"><button class="button primary" type="submit">Create incident</button></div>
+    </form>
+  </section>
+
+  <section class="panel form-panel" aria-labelledby="new-maintenance">
+    <h2 id="new-maintenance" class="panel-title">Start maintenance</h2>
+    <p class="muted">Alerts for the component are muted while the window is open.</p>
+    <form method="post" action="/maintenance" class="form">
+      <div class="field">
+        <label for="m-component">Component</label>
+        <select id="m-component" name="component">
+          <option value="">All components</option>
+          {% for c in components %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="m-duration">Duration (minutes)</label>
+        <input id="m-duration" type="number" name="duration_minutes" value="60" min="1" inputmode="numeric">
+      </div>
+      <div class="field">
+        <label for="m-note">Note</label>
+        <input id="m-note" type="text" name="note" placeholder="Planned upgrade">
+      </div>
+      <div class="actions"><button class="button primary" type="submit">Start maintenance</button></div>
+    </form>
+  </section>
+</div>
+
+<section class="manage-list" aria-labelledby="windows">
+  <h2 id="windows" class="section-title">Maintenance windows</h2>
+  {% if maintenance.is_empty() %}
+  <p class="muted">No active or scheduled maintenance.</p>
+  {% else %}
+  <ul class="plain-list panel">
+    {% for m in maintenance %}
+    <li class="list-row">
+      <div>
+        <p class="row-title">{{ m.component }}{% if !m.note.is_empty() %} <span class="muted">· {{ m.note }}</span>{% endif %}</p>
+        <p class="row-meta num">{% if m.active %}Active until{% else %}Starts <time datetime="{{ m.starts.iso }}" data-local="datetime">{{ m.starts.text }}</time>, ends{% endif %} <time datetime="{{ m.ends.iso }}" data-local="datetime">{{ m.ends.text }}</time></p>
+      </div>
+      <form method="post" action="/maintenance/{{ m.id }}/end" class="inline"><button class="button small" type="submit">End now</button></form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+
+<section class="manage-list" aria-labelledby="open-incidents">
+  <h2 id="open-incidents" class="section-title">Open incidents</h2>
+  {% if active_incidents.is_empty() %}
+  <p class="muted">No open incidents.</p>
+  {% else %}
+  <ul class="plain-list panel">
+    {% for inc in active_incidents %}
+    <li class="list-row">
+      <div>
+        <p class="row-title"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></p>
+        <p class="row-meta"><span class="t-{{ inc.impact_class }}">{{ inc.impact_label }}</span> · {{ inc.component }} · {{ inc.state_label }} · <time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time></p>
+      </div>
+      <a class="button small" href="/incidents/{{ inc.id }}">Update</a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+{% endblock %}

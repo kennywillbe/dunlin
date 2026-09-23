@@ -21,5 +21,6 @@ pub mod status;
 pub mod summary;
 pub mod systemd;
 pub mod templates;
+pub mod theme;
 pub mod web;
 pub mod web_auth;

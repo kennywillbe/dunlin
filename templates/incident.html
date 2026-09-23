@@ -1,44 +1,54 @@
 {% extends "base.html" %}
-{% block title %}{{ title }}{% endblock %}
+{% block title %}{{ incident.title }} · {% endblock %}
 {% block content %}
-<h1>{{ title }}</h1>
-<p class="muted">
-  <span class="state {{ impact_class }}"><span class="dot"></span>{{ impact_label }}</span>
-  · {{ component }} · {{ state_label }} · opened {{ created }}
-  {% if has_resolved %}· resolved {{ resolved }}{% endif %}
-  {% if auto %}· opened automatically{% endif %}
-</p>
+<p class="crumb"><a href="/incidents">Incidents</a></p>
+<header class="incident-header">
+  <h1 class="page-title">{{ incident.title }}</h1>
+  <div class="incident-facts">
+    <span class="badge s-{{ incident.impact_class }}">{{ impact_icon|safe }}{{ incident.impact_label }}</span>
+    <span>{{ incident.component }}</span>
+    {% if incident.resolved.is_some() %}<span>Resolved after {{ incident.duration }}</span>{% else %}<span>Ongoing for {{ incident.duration }}</span>{% endif %}
+    {% if incident.auto %}<span>Opened automatically</span>{% endif %}
+  </div>
+</header>
 
-<h2>Timeline</h2>
-<ul class="timeline">
+<ol class="timeline">
   {% for u in updates %}
-  <li>
-    <div><strong>{{ u.state_label }}</strong> <span class="muted small">{{ u.ts }}</span></div>
-    <div>{{ u.message }}</div>
+  <li class="entry i-{{ u.state_class }}">
+    <h2 class="entry-state">{{ u.state_label }}</h2>
+    <p class="entry-message">{{ u.message }}</p>
+    <p class="entry-time"><time datetime="{{ u.ts.iso }}" data-local="datetime">{{ u.ts.text }}</time></p>
   </li>
   {% endfor %}
-</ul>
+</ol>
 
-{% if logged_in %}
-<h2>Add update</h2>
-<div class="card">
-  <form method="post" action="/incidents/{{ id }}/updates" class="stack">
-    <label>State
-      <select name="state">
+{% if site.logged_in %}
+<section class="panel form-panel" aria-labelledby="post-update">
+  <h2 id="post-update" class="panel-title">Post an update</h2>
+  <form method="post" action="/incidents/{{ incident.id }}/updates" class="form">
+    <div class="field">
+      <label for="u-state">Status</label>
+      <select id="u-state" name="state">
         <option value="investigating">Investigating</option>
         <option value="identified">Identified</option>
         <option value="monitoring">Monitoring</option>
         <option value="resolved">Resolved</option>
       </select>
-    </label>
-    <label>Message<textarea name="message" rows="3" required></textarea></label>
-    <button class="primary" type="submit">Add update</button>
+    </div>
+    <div class="field">
+      <label for="u-message">Message</label>
+      <textarea id="u-message" name="message" rows="3" required></textarea>
+    </div>
+    <div class="actions">
+      <button class="button primary" type="submit">Post update</button>
+    </div>
   </form>
-</div>
-<div class="card">
-  <form method="post" action="/incidents/{{ id }}/resolve">
-    <button class="primary" type="submit">Resolve incident</button>
+  {% if incident.resolved.is_none() %}
+  <form method="post" action="/incidents/{{ incident.id }}/resolve" class="resolve-form">
+    <p class="muted">Resolving closes the incident and adds a final "Resolved" entry.</p>
+    <button class="button" type="submit">Resolve incident</button>
   </form>
-</div>
+  {% endif %}
+</section>
 {% endif %}
 {% endblock %}

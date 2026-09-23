@@ -15,14 +15,16 @@ Licensed under MIT OR Apache-2.0.
   and heartbeat/cron pings.
 - **Status page**: component groups, five states (operational, degraded,
   partial outage, major outage, maintenance), overall banner, 90-day uptime
-  bars, active and recent incidents, Atom feed.
+  bars, active incidents and maintenance, 14 days of past incidents, Atom
+  feed. Light and dark themes, title, accent, logo and extra CSS from the
+  config.
 - **Alerts**: per-check failure / recovery / reminder thresholds, incidents
   opened and resolved automatically, optional maintenance windows that mute
   notifications, Telegram and webhook notifiers, a daily summary.
 - **History**: raw per-minute samples for 7 days and hourly aggregates for
   90 days by default; charts for host, containers and check latency.
-- **Web**: read pages are public by default, every write action needs the
-  password (argon2, per-IP login rate limit, CSRF check). `protect_read = true`
+- **Web**: read pages are public by default; incidents and maintenance are
+  managed on `/manage`, and every write action needs the password (argon2, per-IP login rate limit, CSRF check). `protect_read = true`
   puts the read pages behind the password too.
 - **Config** is a TOML file that is reloaded on change; an invalid new file is
   logged and the running configuration is kept.
@@ -71,6 +73,25 @@ check types with their intervals and thresholds. `dunlin check-config --config
 <path>` validates a file and prints every problem at once.
 
 Durations accept `30s`, `5m`, `1h30m`, `7d` or a bare number of seconds.
+
+### Theme
+
+The `[theme]` table changes how the pages look, without touching templates:
+
+```toml
+[theme]
+title = "Acme status"      # header, tab title and feed title
+accent = "#0f6f73"         # #rrggbb only
+mode = "auto"              # auto | light | dark
+logo = "logo.svg"          # png, svg, jpg or webp, max 256 KB
+custom_css = "custom.css"  # loaded after the built-in stylesheet, max 256 KB
+```
+
+Paths are relative to the config file. Both files are read when the config
+loads and again on every reload, so a broken or oversized file is reported
+like any other config error. The built-in colours are CSS custom properties on
+`:root` (`--bg`, `--surface`, `--text`, `--ok`, `--degraded`, `--major` and so
+on), which is usually all a custom stylesheet needs to override.
 
 The config file is watched. When it changes, dunlin reloads it; if the new file
 is invalid nothing changes and the error is logged.

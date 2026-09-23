@@ -432,6 +432,15 @@ pub async fn recent_incidents(pool: &Pool, limit: i64) -> Result<Vec<Incident>> 
     Ok(rows.iter().map(row_to_incident).collect())
 }
 
+pub async fn incidents_since(pool: &Pool, from: i64) -> Result<Vec<Incident>> {
+    let rows =
+        sqlx::query("SELECT * FROM incidents WHERE created_at >= ? ORDER BY created_at DESC")
+            .bind(from)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.iter().map(row_to_incident).collect())
+}
+
 pub async fn count_incidents_since(pool: &Pool, from: i64) -> Result<i64> {
     let row = sqlx::query("SELECT COUNT(*) AS n FROM incidents WHERE created_at >= ?")
         .bind(from)
@@ -504,6 +513,15 @@ pub async fn active_maintenance(pool: &Pool, now: i64) -> Result<Vec<Maintenance
     .bind(now)
     .fetch_all(pool)
     .await?;
+    Ok(rows.iter().map(row_to_maintenance).collect())
+}
+
+/// Windows that are running now or start later, soonest first.
+pub async fn current_and_upcoming_maintenance(pool: &Pool, now: i64) -> Result<Vec<Maintenance>> {
+    let rows = sqlx::query("SELECT * FROM maintenance WHERE ends_at > ? ORDER BY starts_at")
+        .bind(now)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.iter().map(row_to_maintenance).collect())
 }
 
