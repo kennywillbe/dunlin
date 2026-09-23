@@ -871,3 +871,26 @@ async fn theme_follows_hot_reload() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "body{}");
 }
+
+#[tokio::test]
+async fn incident_on_all_components_shows_on_every_component() {
+    let (state, pool) = state(false).await;
+    db::create_incident(
+        &pool,
+        "",
+        "Everything is on fire",
+        dunlin::models::State::MajorOutage,
+        dunlin::models::IncidentState::Investigating,
+        false,
+        dunlin::now_ts() - 60,
+    )
+    .await
+    .unwrap();
+
+    let (status, _, body) = send(app(state), get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Everything is up."), "{body}");
+    assert!(body.contains("svc s-major_outage"), "{body}");
+    assert!(!body.contains("svc s-operational"), "{body}");
+    assert!(body.contains("bar s-major_outage today"), "{body}");
+}

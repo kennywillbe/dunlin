@@ -470,8 +470,10 @@ async fn build_component(
     let uptime_90 = (total > 0).then(|| format_pct(up as f64 / total as f64 * 100.0));
 
     let window = maintenance.iter().find(|m| m.covers(&comp.id, now));
-    let mine: Vec<&crate::models::Incident> =
-        active.iter().filter(|i| i.component == comp.id).collect();
+    let mine: Vec<&crate::models::Incident> = active
+        .iter()
+        .filter(|i| affects(&i.component, &comp.id))
+        .collect();
     let impact = mine.iter().map(|i| i.impact).max();
     let state = status::component_state(base, window.is_some(), impact);
     let since = mine.iter().map(|i| i.created_at).min();
@@ -518,7 +520,7 @@ async fn build_component(
     let incidents: Vec<&crate::models::Incident> = history
         .incidents
         .iter()
-        .filter(|i| i.component == comp.id)
+        .filter(|i| affects(&i.component, &comp.id))
         .collect();
     let windows: Vec<&crate::models::Maintenance> = history
         .maintenance
@@ -550,6 +552,12 @@ async fn build_component(
         }),
     };
     (view, snap)
+}
+
+/// Whether an incident filed against `target` counts for component `id`. An
+/// empty target is "All components", like an empty maintenance component.
+fn affects(target: &str, id: &str) -> bool {
+    target.is_empty() || target == id
 }
 
 /// Two decimals, but never round a day with downtime up to a clean 100%.
