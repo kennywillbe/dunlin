@@ -59,4 +59,4 @@ tempfile = "3"
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-quick-xml = "0.41"
+quick-xml = "0.42"
