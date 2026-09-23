@@ -25,13 +25,20 @@ jobs:
   test:
     # macOS is here because the systemd client is Linux-only behind
     # cfg(target_os), and a Linux-only run never compiles the other side
-    name: fmt + clippy + tests (${{ matrix.os }})
+    #
+    # The check is named after the platform, not the runner label: branch
+    # protection requires it by name, so pinning a new image must not rename it.
+    name: fmt + clippy + tests (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+          - platform: macos
+            os: macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -47,7 +54,7 @@ jobs:
 
   msrv:
     name: minimum supported Rust version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -63,7 +70,7 @@ jobs:
 
   docker:
     name: container image builds
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
