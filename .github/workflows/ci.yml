@@ -54,7 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           # keep in sync with rust-version in Cargo.toml
-          toolchain: "1.88.0"
+          toolchain: "1.94.0"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
