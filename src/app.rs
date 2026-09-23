@@ -232,52 +232,32 @@ struct ProbeEnv<'a> {
     now: i64,
 }
 
-async fn evaluate(check: &CheckConfig, env: &ProbeEnv<'_>) -> ProbeOutcome {
-    match check.kind {
+/// Run one check. `None` means there was nothing to judge it by (the Docker
+/// or systemd source is off or did not answer), so no result is recorded.
+async fn evaluate(check: &CheckConfig, env: &ProbeEnv<'_>) -> Option<ProbeOutcome> {
+    let latest = |metric: &'static str, key: String| async move {
+        db::latest_sample(env.pool, "host", metric, &key)
+            .await
+            .ok()
+            .flatten()
+    };
+    Some(match check.kind {
         CheckType::Http => prober::probe_http(env.http, check).await,
         CheckType::Tcp => prober::probe_tcp(check).await,
         CheckType::Disk => {
             let key = check.mount.clone().unwrap_or_default();
-            let latest = db::latest_sample(env.pool, "host", "disk_used_pct", &key)
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
+            prober::probe_resource(check, latest("disk_used_pct", key).await)
         }
-        CheckType::Ram => {
-            let latest = db::latest_sample(env.pool, "host", "mem_pct", "")
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
-        }
-        CheckType::Swap => {
-            let latest = db::latest_sample(env.pool, "host", "swap_pct", "")
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
-        }
-        CheckType::Load => {
-            let latest = db::latest_sample(env.pool, "host", "load1", "")
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
-        }
-        CheckType::Docker => match env.containers {
-            Some(c) => prober::probe_docker(check, c),
-            None => ProbeOutcome::up(),
-        },
-        CheckType::Systemd => match env.units {
-            Some(u) => prober::probe_systemd(check, u),
-            None => ProbeOutcome::up(),
-        },
+        CheckType::Ram => prober::probe_resource(check, latest("mem_pct", String::new()).await),
+        CheckType::Swap => prober::probe_resource(check, latest("swap_pct", String::new()).await),
+        CheckType::Load => prober::probe_resource(check, latest("load1", String::new()).await),
+        CheckType::Docker => prober::probe_docker(check, env.containers?),
+        CheckType::Systemd => prober::probe_systemd(check, env.units?),
         CheckType::Heartbeat => {
             let last = db::last_ping(env.pool, &check.id).await.ok().flatten();
             prober::probe_heartbeat(check, last, env.now)
         }
-    }
+    })
 }
 
 fn check_samples(check: &CheckConfig, outcome: &ProbeOutcome, now: i64) -> Vec<Sample> {
@@ -367,23 +347,9 @@ pub async fn prober_loop(
             None
         };
 
-        // Docker/systemd checks whose source is unavailable are skipped rather
-        // than reported down, so a disabled integration cannot raise alerts.
-        let docker_disabled = docker.is_none();
-        let systemd_disabled = systemd.is_none();
-
         let maintenance = db::active_maintenance(&pool, now).await.unwrap_or_default();
 
         for check in &due {
-            if check.kind == CheckType::Docker && docker_disabled {
-                tracing::warn!(check = %check.id, "docker check skipped: docker disabled");
-                continue;
-            }
-            if check.kind == CheckType::Systemd && systemd_disabled {
-                tracing::warn!(check = %check.id, "systemd check skipped: systemd disabled");
-                continue;
-            }
-
             let env = ProbeEnv {
                 pool: &pool,
                 http: &http,
@@ -391,7 +357,13 @@ pub async fn prober_loop(
                 units: unit_states.as_deref(),
                 now,
             };
-            let outcome = evaluate(check, &env).await;
+            // A Docker/systemd check whose source is off or did not answer is
+            // skipped: reporting it up would hide an outage and could resolve
+            // its incident, reporting it down would alert on our own problem.
+            let Some(outcome) = evaluate(check, &env).await else {
+                tracing::warn!(check = %check.id, "check skipped: no data from its source");
+                continue;
+            };
             let result = CheckResult {
                 ts: now,
                 check_id: check.id.clone(),
@@ -548,8 +520,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_checks_without_data_are_skipped_not_passed() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let http = prober::http_client().unwrap();
+        let env = ProbeEnv {
+            pool: &pool,
+            http: &http,
+            containers: None,
+            units: None,
+            now: 0,
+        };
+        let docker = CheckConfig {
+            kind: CheckType::Docker,
+            container: Some("api".into()),
+            ..test_check()
+        };
+        let systemd = CheckConfig {
+            kind: CheckType::Systemd,
+            unit: Some("nginx.service".into()),
+            ..test_check()
+        };
+        assert_eq!(evaluate(&docker, &env).await, None);
+        assert_eq!(evaluate(&systemd, &env).await, None);
+
+        // With data, the same check is judged.
+        let env = ProbeEnv {
+            containers: Some(&[]),
+            ..env
+        };
+        let out = evaluate(&docker, &env).await.unwrap();
+        assert!(!out.ok, "{out:?}");
+    }
+
+    #[tokio::test]
     async fn check_samples_shape() {
-        let check = CheckConfig {
+        let check = test_check();
+        let outcome = ProbeOutcome::up().with_latency(12.0);
+        let samples = check_samples(&check, &outcome, 5);
+        assert!(samples.iter().any(|s| s.metric == "up" && s.value == 1.0));
+        assert!(samples
+            .iter()
+            .any(|s| s.metric == "latency_ms" && s.value == 12.0));
+    }
+
+    fn test_check() -> CheckConfig {
+        CheckConfig {
             id: "c".into(),
             name: "c".into(),
             kind: CheckType::Tcp,
@@ -575,12 +590,6 @@ mod tests {
             period: None,
             grace: None,
             token: None,
-        };
-        let outcome = ProbeOutcome::up().with_latency(12.0);
-        let samples = check_samples(&check, &outcome, 5);
-        assert!(samples.iter().any(|s| s.metric == "up" && s.value == 1.0));
-        assert!(samples
-            .iter()
-            .any(|s| s.metric == "latency_ms" && s.value == 12.0));
+        }
     }
 }
