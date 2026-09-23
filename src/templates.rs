@@ -1,6 +1,7 @@
 //! Askama template structs and their view models.
 
 use askama::Template;
+use chrono_tz::Tz;
 
 use crate::config::Config;
 use crate::models::{Incident, IncidentUpdate};
@@ -18,18 +19,18 @@ pub fn iso8601(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-/// `Sep 24, 2026`, used where a date stands alone (tooltips, aria labels).
-pub fn fmt_day(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|d| d.format("%b %-d, %Y").to_string())
-        .unwrap_or_default()
+/// `Sep 24, 2026` in `tz`, used where a date stands alone (tooltips, aria
+/// labels). Day labels are not rewritten by the page script, so they have to
+/// be in the zone the days were cut in.
+pub fn fmt_day(ts: i64, tz: Tz) -> String {
+    crate::days::date_of(ts, tz)
+        .format("%b %-d, %Y")
+        .to_string()
 }
 
-/// `Sep 24`: the date column of incident rows, where the year is noise.
-pub fn fmt_short_day(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|d| d.format("%b %-d").to_string())
-        .unwrap_or_default()
+/// `Sep 24` in `tz`: the date column of incident rows, where the year is noise.
+pub fn fmt_short_day(ts: i64, tz: Tz) -> String {
+    crate::days::date_of(ts, tz).format("%b %-d").to_string()
 }
 
 /// Compact duration such as `38 min`, `2 h 5 min` or `3 d 4 h`.
@@ -179,7 +180,13 @@ pub struct IncidentView {
 
 impl IncidentView {
     /// `component` is the display name; the caller maps ids to names.
-    pub fn new(inc: &Incident, component: String, last_message: Option<String>, now: i64) -> Self {
+    pub fn new(
+        inc: &Incident,
+        component: String,
+        last_message: Option<String>,
+        now: i64,
+        tz: Tz,
+    ) -> Self {
         let end = inc.resolved_at.unwrap_or(now);
         Self {
             id: inc.id,
@@ -189,7 +196,7 @@ impl IncidentView {
             state_class: inc.state.as_str().to_string(),
             impact_class: inc.impact.as_str().to_string(),
             impact_label: inc.impact.label().to_string(),
-            day: fmt_short_day(inc.created_at),
+            day: fmt_short_day(inc.created_at, tz),
             created: TimeView::datetime(inc.created_at),
             resolved: inc.resolved_at.map(TimeView::datetime),
             duration: human_duration(end - inc.created_at),
@@ -412,6 +419,10 @@ mod tests {
 
     #[test]
     fn day_format() {
-        assert_eq!(fmt_day(1_758_700_000), "Sep 24, 2025");
+        assert_eq!(fmt_day(1_758_700_000, Tz::UTC), "Sep 24, 2025");
+        // 2026-09-23 23:28 UTC is 02:28 on Sep 24 in Istanbul.
+        let ts = 1_790_206_080;
+        assert_eq!(fmt_short_day(ts, Tz::UTC), "Sep 23");
+        assert_eq!(fmt_short_day(ts, chrono_tz::Europe::Istanbul), "Sep 24");
     }
 }

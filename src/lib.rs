@@ -10,6 +10,7 @@ pub mod app;
 pub mod auth;
 pub mod collector;
 pub mod config;
+pub mod days;
 pub mod db;
 pub mod docker;
 pub mod models;

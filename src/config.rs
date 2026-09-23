@@ -218,11 +218,12 @@ fn d90() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryConfig {
-    /// Local wall-clock time, `HH:MM`.
+    /// Wall-clock time in the top-level `timezone`, `HH:MM`.
     pub time: String,
-    /// IANA timezone, e.g. `Europe/Berlin`.
-    #[serde(default = "default_tz")]
-    pub timezone: String,
+    /// Only read to point an old config at the top-level key; left to
+    /// `deny_unknown_fields` it would fail with a bare "unknown field".
+    #[serde(default, rename = "timezone")]
+    pub moved_timezone: Option<String>,
 }
 
 fn default_tz() -> String {
@@ -424,6 +425,10 @@ pub struct Config {
     /// Set the `Secure` flag on the session cookie when served over HTTPS.
     #[serde(default)]
     pub secure_cookies: bool,
+    /// IANA name that decides where a day starts: the tick strips, the day
+    /// rows, the month groups and the daily summary.
+    #[serde(default = "default_tz")]
+    pub timezone: String,
     #[serde(default)]
     pub web: WebConfig,
     #[serde(default)]
@@ -465,6 +470,7 @@ impl Default for Config {
             proc_root: default_proc_root(),
             trusted_proxy: false,
             secure_cookies: false,
+            timezone: default_tz(),
             web: WebConfig::default(),
             retention: RetentionConfig::default(),
             summary: None,
@@ -499,6 +505,11 @@ impl Config {
 
     pub fn component(&self, id: &str) -> Option<&ComponentConfig> {
         self.components.iter().find(|c| c.id == id)
+    }
+
+    /// Falls back to UTC only for a config that skipped `validate`.
+    pub fn tz(&self) -> chrono_tz::Tz {
+        self.timezone.parse().unwrap_or(chrono_tz::Tz::UTC)
     }
 }
 
@@ -548,15 +559,22 @@ pub fn validate(cfg: &Config) -> Result<()> {
     if cfg.summary.is_none() && cfg.notifiers.is_empty() {
         // No notifiers is allowed; it just means alerts only appear in the UI.
     }
+    if cfg.timezone.parse::<chrono_tz::Tz>().is_err() {
+        errs.push(format!(
+            "timezone {:?} is not a valid IANA name such as \"Europe/Istanbul\"",
+            cfg.timezone
+        ));
+    }
     if let Some(s) = &cfg.summary {
         if parse_hhmm(&s.time).is_none() {
             errs.push(format!("summary.time {:?} must be HH:MM", s.time));
         }
-        if s.timezone.parse::<chrono_tz::Tz>().is_err() {
-            errs.push(format!(
-                "summary.timezone {:?} is not a valid IANA name",
-                s.timezone
-            ));
+        if s.moved_timezone.is_some() {
+            errs.push(
+                "summary.timezone was moved: set the top-level `timezone` key instead \
+                 (it now applies to the whole status page)"
+                    .to_string(),
+            );
         }
     }
 
@@ -725,7 +743,7 @@ pub fn parse_hhmm(s: &str) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -878,7 +896,33 @@ check = "nope"
         assert!(parse_str_at(&s, dir.path()).is_err());
     }
 
-    pub(super) fn base_with_real_hash() -> String {
+    #[test]
+    fn timezone_is_top_level_and_validated() {
+        let cfg = parse_str(&base_with_real_hash()).unwrap();
+        assert_eq!(cfg.tz(), chrono_tz::Tz::UTC);
+
+        let s = format!("timezone = \"Europe/Istanbul\"\n{}", base_with_real_hash());
+        assert_eq!(parse_str(&s).unwrap().tz(), chrono_tz::Europe::Istanbul);
+
+        let s = format!("timezone = \"Europe/Istambul\"\n{}", base_with_real_hash());
+        let err = parse_str(&s).unwrap_err().to_string();
+        assert!(
+            err.contains("\"Europe/Istambul\" is not a valid IANA name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn summary_timezone_points_at_the_new_key() {
+        let s = format!(
+            "{}\n[summary]\ntime = \"09:00\"\ntimezone = \"Europe/Berlin\"\n",
+            base_with_real_hash()
+        );
+        let err = parse_str(&s).unwrap_err().to_string();
+        assert!(err.contains("top-level `timezone`"), "{err}");
+    }
+
+    pub(crate) fn base_with_real_hash() -> String {
         // hash for "correcthorsebattery" generated with argon2 defaults
         let hash = crate::auth::hash_password("correcthorsebattery").unwrap();
         format!("listen = \"127.0.0.1:8080\"\n[web]\npassword_hash = \"{hash}\"\n")
