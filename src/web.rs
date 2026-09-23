@@ -1095,7 +1095,11 @@ async fn manage_page(State(state): State<AppState>, jar: CookieJar) -> Response 
     })
 }
 
-async fn feed(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn feed(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar) -> Response {
+    // The feed carries incident titles and messages, so it is a read page too.
+    if let Some(r) = read_guard(&state, &jar).await {
+        return r;
+    }
     let cfg = state.cfg();
     let host = headers
         .get(axum::http::header::HOST)

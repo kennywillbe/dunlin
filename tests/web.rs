@@ -259,12 +259,22 @@ async fn protect_read_locks_read_pages() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(headers.get("location").unwrap(), "/login");
 
+    // The feed repeats incident titles and messages, so it is locked too.
+    let (status, headers, _) = send(app.clone(), get("/feed.xml")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers.get("location").unwrap(), "/login");
+
     let cookie = login(&app).await;
     let mut req = get("/");
     req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
-    let (status, _, body) = send(app, req).await;
+    let (status, _, body) = send(app.clone(), req).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Website"));
+
+    let mut req = get("/feed.xml");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
