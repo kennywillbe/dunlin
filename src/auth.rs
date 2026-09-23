@@ -1,9 +1,8 @@
 //! Password hashing and constant-time token helpers.
 
 use anyhow::{bail, Result};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
-use rand::RngCore;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -16,9 +15,8 @@ pub fn hash_password(password: &str) -> Result<String> {
     }
     let mut salt_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut salt_bytes);
-    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| anyhow::anyhow!("salt: {e}"))?;
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt_bytes)
         .map_err(|e| anyhow::anyhow!("hashing failed: {e}"))?
         .to_string();
     Ok(hash)
@@ -61,6 +59,22 @@ mod tests {
         assert!(!verify_password("wrong", &h).unwrap());
     }
 
+    // Hashes written by earlier releases (argon2 0.5) live in users' configs;
+    // this is the one shipped in dunlin.example.toml.
+    #[test]
+    fn verifies_existing_phc_hash() {
+        let phc = "$argon2id$v=19$m=19456,t=2,p=1$HAxHiOcZJRfd5p0TbNMaUA$WaS5hjKfMZye0zcHnrwWqsUu3nWHgBWqzO/9D46dUYo";
+        assert!(verify_password("changemechangeme", phc).unwrap());
+        assert!(!verify_password("changemechangemf", phc).unwrap());
+    }
+
+    #[test]
+    fn new_hash_is_default_argon2id_phc() {
+        let h = hash_password("correcthorsebattery").unwrap();
+        assert!(h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{h}");
+        assert!(PasswordHash::new(&h).is_ok());
+    }
+
     #[test]
     fn min_length() {
         assert!(hash_password("short").is_err());
@@ -75,6 +89,16 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert_ne!(token_hash(&a), token_hash(&b));
         assert_eq!(token_hash(&a).len(), 64);
+    }
+
+    // Session rows store this hash, so a change in its encoding would log
+    // everyone out after an upgrade.
+    #[test]
+    fn token_hash_is_lowercase_hex_sha256() {
+        assert_eq!(
+            token_hash("dunlin-session-token"),
+            "081738e774805599d2e0b4c3c9659b09ddddda8c80acbe1bdcec025f15666214"
+        );
     }
 
     #[test]

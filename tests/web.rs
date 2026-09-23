@@ -415,7 +415,7 @@ async fn feed_is_valid_atom() {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_string();
                 if root.is_empty() {
                     root = name.clone();
                 }
