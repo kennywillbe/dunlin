@@ -22,8 +22,12 @@ fn test_config(protect_read: bool) -> Arc<Config> {
 /// `extra` is appended to the base TOML (e.g. a `[theme]` table); relative
 /// theme paths resolve against `base`.
 fn test_config_with(protect_read: bool, extra: &str, base: &std::path::Path) -> Arc<Config> {
+    Arc::new(config::parse_str_at(&config_toml(protect_read, extra), base).unwrap())
+}
+
+fn config_toml(protect_read: bool, extra: &str) -> String {
     let hash = dunlin::auth::hash_password(PASSWORD).unwrap();
-    let toml = format!(
+    format!(
         r#"
 listen = "127.0.0.1:0"
 [web]
@@ -57,8 +61,7 @@ check = "c1"
 
 {extra}
 "#
-    );
-    Arc::new(config::parse_str_at(&toml, base).unwrap())
+    )
 }
 
 async fn state(protect_read: bool) -> (AppState, Pool) {
@@ -545,6 +548,90 @@ async fn status_page_structure() {
         body.contains("<dt>Open incidents</dt><dd>1</dd>"),
         "facts list"
     );
+}
+
+/// The `<div class="entry">` of the day row whose `datetime` is `iso`.
+fn day_row<'a>(body: &'a str, iso: &str) -> &'a str {
+    let start = body
+        .find(&format!("datetime=\"{iso}\""))
+        .unwrap_or_else(|| panic!("no row for {iso}"));
+    let rest = &body[start..];
+    &rest[..rest.find("<div class=\"entry\">").unwrap_or(rest.len())]
+}
+
+#[tokio::test]
+async fn days_follow_the_configured_timezone() {
+    use chrono::{TimeZone, Utc};
+    let tz = chrono_tz::Europe::Istanbul;
+    let cfg = Arc::new(
+        config::parse_str(&format!(
+            "timezone = \"Europe/Istanbul\"\n{}",
+            config_toml(false, "")
+        ))
+        .unwrap(),
+    );
+    let (state, pool) = state_from(cfg).await;
+    let now = dunlin::now_ts();
+
+    // 02:28 local yesterday, which is still the day before in UTC.
+    let yesterday = Utc
+        .timestamp_opt(now, 0)
+        .unwrap()
+        .with_timezone(&tz)
+        .date_naive()
+        .pred_opt()
+        .unwrap();
+    let opened = tz
+        .from_local_datetime(&yesterday.and_hms_opt(2, 28, 0).unwrap())
+        .unwrap()
+        .timestamp();
+    db::create_incident(
+        &pool,
+        "web",
+        "Night outage",
+        dunlin::models::State::MajorOutage,
+        dunlin::models::IncidentState::Resolved,
+        false,
+        opened,
+    )
+    .await
+    .unwrap();
+    // The first of a month just after local midnight is the previous month
+    // in UTC.
+    let first = tz
+        .with_ymd_and_hms(2026, 9, 1, 0, 30, 0)
+        .unwrap()
+        .timestamp();
+    db::create_incident(
+        &pool,
+        "web",
+        "Month edge",
+        dunlin::models::State::Degraded,
+        dunlin::models::IncidentState::Resolved,
+        false,
+        first,
+    )
+    .await
+    .unwrap();
+
+    let app = app(state);
+    let (_, _, body) = send(app.clone(), get("/")).await;
+    let iso = yesterday.format("%Y-%m-%d").to_string();
+    let row = day_row(&body, &iso);
+    assert!(row.contains("Night outage"), "{row}");
+    assert!(
+        row.contains(&yesterday.format(">%b %-d<").to_string()),
+        "{row}"
+    );
+    let day_before = yesterday.pred_opt().unwrap().format("%Y-%m-%d").to_string();
+    assert!(!day_row(&body, &day_before).contains("Night outage"));
+
+    let (_, _, body) = send(app, get("/incidents")).await;
+    let before = &body[..body.find("Month edge").unwrap()];
+    let entry = &before[before.rfind("<div class=\"entry\">").unwrap()..];
+    assert!(entry.contains(">Sep 1<"), "{entry}");
+    let month = &before[before.rfind("class=\"month-name\"").unwrap()..];
+    assert!(month.contains(">September 2026<"), "{month}");
 }
 
 #[tokio::test]

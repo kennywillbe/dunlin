@@ -228,20 +228,24 @@ pub async fn uptime_between(pool: &Pool, check_id: &str, from: i64, to: i64) -> 
     Ok((row.get("total"), row.get("up")))
 }
 
-/// Per-day (UTC) uptime as `(day_start, total, up)` for a check.
-pub async fn daily_uptime(pool: &Pool, check_id: &str, from: i64) -> Result<Vec<(i64, i64, i64)>> {
+/// Uptime per [`SLOT_SECS`](crate::days::SLOT_SECS) slot as
+/// `(slot_start, total, up)` for a check. Days are summed from slots in Rust
+/// because SQLite has no timezone rules to find a local midnight with.
+pub async fn uptime_slots(pool: &Pool, check_id: &str, from: i64) -> Result<Vec<(i64, i64, i64)>> {
     let rows = sqlx::query(
-        "SELECT (ts / 86400) * 86400 AS day, COUNT(*) AS total, COALESCE(SUM(ok),0) AS up
+        "SELECT (ts / ?) * ? AS slot, COUNT(*) AS total, COALESCE(SUM(ok),0) AS up
          FROM check_results WHERE check_id = ? AND ts >= ?
-         GROUP BY day ORDER BY day",
+         GROUP BY slot ORDER BY slot",
     )
+    .bind(crate::days::SLOT_SECS)
+    .bind(crate::days::SLOT_SECS)
     .bind(check_id)
     .bind(from)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.get("day"), r.get("total"), r.get("up")))
+        .map(|r| (r.get("slot"), r.get("total"), r.get("up")))
         .collect())
 }
 

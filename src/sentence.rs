@@ -64,6 +64,8 @@ pub struct StatusFacts<'a> {
     pub last_resolved: Option<i64>,
     pub upcoming: &'a [Upcoming],
     pub now: i64,
+    /// Where "today" starts for the quiet-days count.
+    pub tz: chrono_tz::Tz,
 }
 
 /// `11 minutes`, `2 hours`, `3 days`: one unit, rounded down, because the
@@ -222,7 +224,10 @@ pub fn status_say(f: &StatusFacts<'_>) -> Say {
     }
 
     let headline = if worst == State::Operational {
-        push_sentence(&mut detail, vec![text(quiet_since(f.last_resolved, f.now))]);
+        push_sentence(
+            &mut detail,
+            vec![text(quiet_since(f.last_resolved, f.now, f.tz))],
+        );
         vec![text("Everything is up.")]
     } else {
         let group: Vec<&Snapshot> = comps.iter().filter(|c| c.state == worst).collect();
@@ -309,11 +314,15 @@ fn push_sentence(detail: &mut Vec<Part>, parts: Vec<Part>) {
     detail.extend(parts);
 }
 
-fn quiet_since(last_resolved: Option<i64>, now: i64) -> String {
+/// Counts calendar days, not 24-hour spans, so "earlier today" and the day
+/// rows below the sentence agree about which day something happened on.
+fn quiet_since(last_resolved: Option<i64>, now: i64, tz: chrono_tz::Tz) -> String {
+    use crate::days::date_of;
     match last_resolved {
         None => "Nothing has broken yet.".to_string(),
-        Some(t) => match (now - t).max(0) / 86_400 {
+        Some(t) => match (date_of(now, tz) - date_of(t.min(now), tz)).num_days() {
             0 => "Nothing has broken since earlier today.".to_string(),
+            1 => "Nothing has broken since yesterday.".to_string(),
             n => format!("Nothing has broken in {}.", plural(n, "day")),
         },
     }
@@ -576,13 +585,33 @@ mod tests {
             now: NOW,
             ..Default::default()
         });
-        assert_eq!(flat(&s.detail), "Nothing has broken in 1 day.");
+        assert_eq!(flat(&s.detail), "Nothing has broken since yesterday.");
         let s = status_say(&StatusFacts {
             components: &ok,
             last_resolved: Some(NOW - 600),
             now: NOW,
             ..Default::default()
         });
+        assert_eq!(flat(&s.detail), "Nothing has broken since earlier today.");
+    }
+
+    #[test]
+    fn quiet_days_follow_the_configured_zone() {
+        let ok = [comp("a", State::Operational)];
+        // Resolved 23:50 on Sep 23 in Istanbul, now 00:10 on Sep 24 there;
+        // both are still Sep 23 in UTC.
+        let resolved = 1_790_196_600;
+        let now = resolved + 20 * 60;
+        let facts = |tz| StatusFacts {
+            components: &ok,
+            last_resolved: Some(resolved),
+            now,
+            tz,
+            ..Default::default()
+        };
+        let s = status_say(&facts(chrono_tz::Europe::Istanbul));
+        assert_eq!(flat(&s.detail), "Nothing has broken since yesterday.");
+        let s = status_say(&facts(chrono_tz::Tz::UTC));
         assert_eq!(flat(&s.detail), "Nothing has broken since earlier today.");
     }
 

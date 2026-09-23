@@ -464,7 +464,7 @@ pub async fn summary_loop(
             .flatten()
             .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok());
         let now_utc = chrono::Utc::now();
-        let Some(date) = summary::should_send(&summary_cfg, now_utc, last_sent) else {
+        let Some(date) = summary::should_send(&summary_cfg, cfg.tz(), now_utc, last_sent) else {
             continue;
         };
         let notification = build_summary(&pool, &cfg, crate::now_ts()).await;

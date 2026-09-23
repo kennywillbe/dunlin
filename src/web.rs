@@ -18,6 +18,7 @@ use tokio::sync::watch;
 use crate::auth;
 use crate::collector::configured_mounts;
 use crate::config::{CheckType, Config};
+use crate::days::Day;
 use crate::db::{self, Pool};
 use crate::models::State as CompState;
 use crate::status;
@@ -198,6 +199,7 @@ async fn incident_views(
             component_name(cfg, &inc.component),
             msg,
             now,
+            cfg.tz(),
         ));
     }
     out
@@ -206,10 +208,10 @@ async fn incident_views(
 // -- read pages ------------------------------------------------------------
 
 /// How many days of history the status page lists, as on Statuspage.
-const PAST_DAYS: i64 = 14;
+const PAST_DAYS: usize = 14;
 
 /// Window of the tick strips.
-const STRIP_DAYS: i64 = 90;
+const STRIP_DAYS: usize = 90;
 
 fn fmt_every(secs: u64) -> String {
     if secs < 120 || !secs.is_multiple_of(60) {
@@ -260,9 +262,11 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
         .await
         .unwrap_or_default();
     let active = db::active_incidents(&state.pool).await.unwrap_or_default();
-    let today = now.div_euclid(86_400) * 86_400;
-    let strip_from = today - (STRIP_DAYS - 1) * 86_400;
+    let tz = cfg.tz();
+    let strip = crate::days::last_days(now, STRIP_DAYS, tz);
+    let strip_from = strip.first().map_or(now, |d| d.start);
     let history = History {
+        days: strip,
         incidents: db::incidents_since(&state.pool, strip_from)
             .await
             .unwrap_or_default(),
@@ -336,10 +340,10 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
         last_resolved: db::last_resolved_at(&state.pool).await.ok().flatten(),
         upcoming: &upcoming,
         now,
+        tz,
     });
 
-    let past_from = today - (PAST_DAYS - 1) * 86_400;
-    let past_days = past_days(&cfg, &history, past_from, today, now);
+    let past_days = past_days(&cfg, &history, now);
 
     render(&StatusTemplate {
         site: SiteView::new(&cfg, logged_in, "status"),
@@ -353,22 +357,22 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
     })
 }
 
-/// Incidents and maintenance of the strip window, fetched once per page.
+/// The strip's days with their incidents and maintenance, fetched once per
+/// page.
 struct History {
+    days: Vec<Day>,
     incidents: Vec<crate::models::Incident>,
     maintenance: Vec<crate::models::Maintenance>,
 }
 
 /// "What happened lately": one row per day, newest first.
-fn past_days(cfg: &Config, h: &History, from: i64, today: i64, now: i64) -> Vec<DayView> {
-    let day_of = |ts: i64| ts.div_euclid(86_400) * 86_400;
-    let mut days = Vec::new();
-    let mut day = today;
-    while day >= from {
+fn past_days(cfg: &Config, h: &History, now: i64) -> Vec<DayView> {
+    let mut out = Vec::with_capacity(PAST_DAYS);
+    for day in h.days.iter().rev().take(PAST_DAYS) {
         let mut items: Vec<(i64, PastItem)> = h
             .incidents
             .iter()
-            .filter(|i| day_of(i.created_at) == day)
+            .filter(|i| day.contains(i.created_at))
             .map(|i| {
                 let note = match i.resolved_at {
                     Some(r) => format!("Resolved · {}", human_duration(r - i.created_at)),
@@ -388,7 +392,7 @@ fn past_days(cfg: &Config, h: &History, from: i64, today: i64, now: i64) -> Vec<
         items.extend(
             h.maintenance
                 .iter()
-                .filter(|m| day_of(m.starts_at) == day && m.starts_at <= now)
+                .filter(|m| day.contains(m.starts_at) && m.starts_at <= now)
                 .map(|m| {
                     let title = if m.note.trim().is_empty() {
                         format!("Maintenance on {}", component_name(cfg, &m.component))
@@ -412,14 +416,13 @@ fn past_days(cfg: &Config, h: &History, from: i64, today: i64, now: i64) -> Vec<
                 }),
         );
         items.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
-        days.push(DayView {
-            heading: fmt_short_day(day),
-            iso: iso8601(day)[..10].to_string(),
+        out.push(DayView {
+            heading: day.date.format("%b %-d").to_string(),
+            iso: day.iso(),
             items: items.into_iter().map(|(_, i)| i).collect(),
         });
-        day -= 86_400;
     }
-    days
+    out
 }
 
 fn kind_word(kind: CheckType) -> &'static str {
@@ -454,10 +457,11 @@ async fn build_component(
                 .await
                 .unwrap_or(0);
             let base = status::check_state(last.as_ref(), failures, check.failures_to_open);
-            let daily = db::daily_uptime(pool, &check.id, now - STRIP_DAYS * 86_400)
+            let from = history.days.first().map_or(now, |d| d.start);
+            let slots = db::uptime_slots(pool, &check.id, from)
                 .await
                 .unwrap_or_default();
-            (base, daily, last)
+            (base, slots, last)
         }
         None => (CompState::Operational, Vec::new(), None),
     };
@@ -530,7 +534,7 @@ async fn build_component(
         sub,
         sub_class,
         uptime_90,
-        bars: build_bars(&daily, &incidents, &windows, now),
+        bars: build_bars(&daily, &history.days, cfg.tz(), &incidents, &windows, now),
     };
     let snap = crate::sentence::Snapshot {
         name: comp.name.clone(),
@@ -575,25 +579,27 @@ fn day_state(uptime: f64) -> CompState {
 /// manual incident shows even when the probes kept passing; maintenance only
 /// shows on a day that had nothing worse.
 fn build_bars(
-    daily: &[(i64, i64, i64)],
+    slots: &[(i64, i64, i64)],
+    strip: &[Day],
+    tz: chrono_tz::Tz,
     incidents: &[&crate::models::Incident],
     windows: &[&crate::models::Maintenance],
     now: i64,
 ) -> Vec<BarView> {
-    status::uptime_bars(daily, STRIP_DAYS, now)
+    status::uptime_bars(slots, strip, tz)
         .into_iter()
         .map(|b| {
-            let date = fmt_day(b.day);
-            let end = b.day + 86_400;
+            let date = b.day.date.format("%b %-d, %Y").to_string();
+            let (start, end) = (b.day.start, b.day.end);
             let impact = incidents
                 .iter()
-                .filter(|i| i.created_at < end && i.resolved_at.unwrap_or(now) >= b.day)
+                .filter(|i| i.created_at < end && i.resolved_at.unwrap_or(now) >= start)
                 .map(|i| i.impact)
                 .filter(|s| *s != CompState::Maintenance)
                 .max();
             let maint = windows
                 .iter()
-                .any(|m| m.starts_at < end && m.ends_at > b.day);
+                .any(|m| b.day.overlaps(m.starts_at, m.ends_at));
             let from_uptime = b.uptime.map(day_state);
             let state = match (from_uptime, impact) {
                 (Some(a), Some(b)) => Some(a.max(b)),
@@ -949,12 +955,13 @@ async fn incidents_page(State(state): State<AppState>, jar: CookieJar) -> Respon
     let incidents = db::recent_incidents(&state.pool, 100)
         .await
         .unwrap_or_default();
+    let tz = cfg.tz();
     let mut months: Vec<MonthView> = Vec::new();
     for inc in &incidents {
-        let name = chrono::DateTime::from_timestamp(inc.created_at, 0)
-            .map(|d| d.format("%B %Y").to_string())
-            .unwrap_or_default();
-        let view = IncidentView::new(inc, component_name(&cfg, &inc.component), None, now);
+        let name = crate::days::date_of(inc.created_at, tz)
+            .format("%B %Y")
+            .to_string();
+        let view = IncidentView::new(inc, component_name(&cfg, &inc.component), None, now, tz);
         match months.last_mut() {
             Some(m) if m.name == name => m.incidents.push(view),
             _ => months.push(MonthView {
@@ -1047,7 +1054,13 @@ async fn incident_page(
     render(&IncidentTemplate {
         site: SiteView::new(&cfg, logged_in, "incidents"),
         side: SideView::plain(&inc.title, &detail),
-        incident: IncidentView::new(&inc, component_name(&cfg, &inc.component), None, now),
+        incident: IncidentView::new(
+            &inc,
+            component_name(&cfg, &inc.component),
+            None,
+            now,
+            cfg.tz(),
+        ),
         updates,
     })
 }

@@ -27,6 +27,12 @@ trusted_proxy = false
 # Default: false
 secure_cookies = false
 
+# IANA timezone that decides where a day starts: the 90-day strips, the day
+# rows on the status page, the month groups on /incidents and the daily
+# summary time. Times of day are still shown in each visitor's own zone.
+# Default: "UTC"
+timezone = "Europe/Berlin"
+
 [web]
 # Require the password for the read-only pages as well.
 # Default: false
@@ -60,10 +66,9 @@ raw_days = 7
 hourly_days = 90
 
 # Daily summary message (also proves dunlin is running). Optional; omit to
-# disable. Sent once per local day at `time`.
+# disable. Sent once a day at `time` in the top-level `timezone`.
 [summary]
 time = "09:00"
-timezone = "Europe/Berlin"
 
 [docker]
 # Collect container metrics and enable docker checks. Default: false

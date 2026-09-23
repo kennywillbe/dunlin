@@ -74,6 +74,18 @@ check types with their intervals and thresholds. `dunlin check-config --config
 
 Durations accept `30s`, `5m`, `1h30m`, `7d` or a bare number of seconds.
 
+### Timezone
+
+`timezone` (top level, an IANA name such as `"Europe/Istanbul"`, default
+`"UTC"`) decides where a day starts: the 90-day strips, the "What happened
+lately" rows, the month groups on `/incidents` and when the daily summary is
+sent. Times of day are still shown in each visitor's own zone by the page
+script. Day and month labels are not, they stay in the configured zone.
+
+DST days are 23 or 25 hours long and count as one day each. Per-day uptime is
+summed from 15-minute slots, which lines up with every offset in use today
+(`+05:30`, `+05:45` included). Hourly metric aggregates stay in UTC hours.
+
 ### Theme
 
 The `[theme]` table changes how the pages look, without touching templates:

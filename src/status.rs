@@ -1,5 +1,9 @@
 //! Deriving component and overall status from recorded results.
 
+use chrono::NaiveDate;
+use chrono_tz::Tz;
+
+use crate::days::{date_of, Day};
 use crate::models::{CheckResult, State};
 
 /// State of a check from its latest result and consecutive failure count.
@@ -46,31 +50,30 @@ pub fn overall(states: impl IntoIterator<Item = State>) -> State {
 /// One bar of the 90-day uptime strip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DayBar {
-    pub day: i64,
+    pub day: Day,
     /// `None` when no probes were recorded that day.
     pub uptime: Option<f64>,
 }
 
-/// Build `days` UTC-day bars ending today, from `(day_start, total, up)` rows.
-pub fn uptime_bars(daily: &[(i64, i64, i64)], days: i64, now: i64) -> Vec<DayBar> {
+/// One bar per entry of `days`, summed from `(slot_start, total, up)` rows.
+pub fn uptime_bars(slots: &[(i64, i64, i64)], days: &[Day], tz: Tz) -> Vec<DayBar> {
     use std::collections::HashMap;
-    let map: HashMap<i64, (i64, i64)> = daily
-        .iter()
-        .map(|(d, total, up)| (*d, (*total, *up)))
-        .collect();
-    let today = (now.div_euclid(86_400)) * 86_400;
-    (0..days)
-        .rev()
-        .map(|offset| {
-            let day = today - offset * 86_400;
-            let uptime = map.get(&day).and_then(|(total, up)| {
+    let mut per_day: HashMap<NaiveDate, (i64, i64)> = HashMap::new();
+    for (slot, total, up) in slots {
+        let e = per_day.entry(date_of(*slot, tz)).or_default();
+        e.0 += total;
+        e.1 += up;
+    }
+    days.iter()
+        .map(|day| {
+            let uptime = per_day.get(&day.date).and_then(|(total, up)| {
                 if *total > 0 {
                     Some(*up as f64 / *total as f64 * 100.0)
                 } else {
                     None
                 }
             });
-            DayBar { day, uptime }
+            DayBar { day: *day, uptime }
         })
         .collect()
 }
@@ -134,14 +137,58 @@ mod tests {
 
     #[test]
     fn bars_cover_window_and_compute_uptime() {
-        let now = 10 * 86_400 + 3600; // day 10, 01:00
-        let daily = vec![(9 * 86_400, 100, 99), (10 * 86_400, 4, 3)];
-        let bars = uptime_bars(&daily, 90, now);
+        let now = 10 * 86_400 + 3600; // day 10, 01:00 UTC
+        let slots = vec![
+            (9 * 86_400, 60, 60),
+            (9 * 86_400 + 900, 40, 39),
+            (10 * 86_400, 4, 3),
+        ];
+        let days = crate::days::last_days(now, 90, Tz::UTC);
+        let bars = uptime_bars(&slots, &days, Tz::UTC);
         assert_eq!(bars.len(), 90);
-        assert_eq!(bars[88].day, 9 * 86_400);
+        assert_eq!(bars[88].day.start, 9 * 86_400);
         assert_eq!(bars[88].uptime, Some(99.0));
-        assert_eq!(bars[89].day, 10 * 86_400);
+        assert_eq!(bars[89].day.start, 10 * 86_400);
         assert_eq!(bars[89].uptime, Some(75.0));
         assert_eq!(bars[0].uptime, None);
+    }
+
+    #[test]
+    fn istanbul_bars_follow_local_midnight() {
+        let tz = chrono_tz::Europe::Istanbul;
+        // 2026-09-23 23:15 UTC is 02:15 on Sep 24 in Istanbul.
+        let late = 1_790_205_300;
+        let slots = vec![(late - 3 * 3600, 10, 10), (late, 10, 0)];
+        let days = crate::days::last_days(late, 2, tz);
+        let bars = uptime_bars(&slots, &days, tz);
+        assert_eq!(bars[0].day.iso(), "2026-09-23");
+        assert_eq!(bars[0].uptime, Some(100.0));
+        assert_eq!(bars[1].day.iso(), "2026-09-24");
+        assert_eq!(bars[1].uptime, Some(0.0));
+        // In UTC both slots are on Sep 23.
+        let days = crate::days::last_days(late, 2, Tz::UTC);
+        let bars = uptime_bars(&slots, &days, Tz::UTC);
+        assert_eq!(bars[1].day.iso(), "2026-09-23");
+        assert_eq!(bars[1].uptime, Some(50.0));
+    }
+
+    #[test]
+    fn dst_day_counts_every_slot_once() {
+        let tz = chrono_tz::Europe::Berlin;
+        let day = Day::on(NaiveDate::from_ymd_opt(2026, 10, 25).unwrap(), tz);
+        // Up only inside the long day, so a leak either way shows as < 100%
+        // there or > 0% next door.
+        let slots: Vec<_> = (day.start - 3600..day.end + 3600)
+            .step_by(900)
+            .map(|s| (s, 1, i64::from(day.contains(s))))
+            .collect();
+        let prev = Day::on(day.date.pred_opt().unwrap(), tz);
+        let next = Day::on(day.date.succ_opt().unwrap(), tz);
+        let bars = uptime_bars(&slots, &[prev, day, next], tz);
+        assert_eq!(bars[0].uptime, Some(0.0));
+        assert_eq!(bars[1].uptime, Some(100.0));
+        assert_eq!(bars[2].uptime, Some(0.0));
+        let inside = slots.iter().filter(|(s, _, _)| day.contains(*s)).count();
+        assert_eq!(inside, 25 * 4);
     }
 }

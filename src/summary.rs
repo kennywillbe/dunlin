@@ -23,15 +23,15 @@ impl ComponentUptime {
     }
 }
 
-/// Returns the local date to send for, or `None` when it is not yet due or was
-/// already sent today. Uses `>=` so a process that started after the configured
-/// time still sends once.
+/// Returns the date in `tz` to send for, or `None` when it is not yet due or
+/// was already sent that day. Uses `>=` so a process that started after the
+/// configured time still sends once.
 pub fn should_send(
     summary: &SummaryConfig,
+    tz: Tz,
     now: DateTime<Utc>,
     last_sent: Option<NaiveDate>,
 ) -> Option<NaiveDate> {
-    let tz: Tz = summary.timezone.parse().ok()?;
     let (hour, minute) = crate::config::parse_hhmm(&summary.time)?;
     let local = now.with_timezone(&tz);
     let today = local.date_naive();
@@ -94,24 +94,40 @@ mod tests {
     fn summary() -> SummaryConfig {
         SummaryConfig {
             time: "09:30".into(),
-            timezone: "Europe/Berlin".into(),
+            moved_timezone: None,
         }
     }
+
+    const BERLIN: Tz = chrono_tz::Europe::Berlin;
 
     #[test]
     fn due_only_after_time_and_once_per_day() {
         let s = summary();
         // 07:00 UTC = 09:00 Berlin (CEST, +2) -> before 09:30
         let before = Utc.with_ymd_and_hms(2026, 6, 1, 7, 0, 0).unwrap();
-        assert_eq!(should_send(&s, before, None), None);
+        assert_eq!(should_send(&s, BERLIN, before, None), None);
         // 07:31 UTC = 09:31 Berlin -> due
         let due = Utc.with_ymd_and_hms(2026, 6, 1, 7, 31, 0).unwrap();
-        let date = should_send(&s, due, None).unwrap();
+        let date = should_send(&s, BERLIN, due, None).unwrap();
         // already sent today -> no
-        assert_eq!(should_send(&s, due, Some(date)), None);
+        assert_eq!(should_send(&s, BERLIN, due, Some(date)), None);
         // next day -> due again
         let next = Utc.with_ymd_and_hms(2026, 6, 2, 8, 0, 0).unwrap();
-        assert!(should_send(&s, next, Some(date)).is_some());
+        assert!(should_send(&s, BERLIN, next, Some(date)).is_some());
+    }
+
+    #[test]
+    fn uses_the_top_level_timezone() {
+        let cfg = crate::config::parse_str(&format!(
+            "timezone = \"Europe/Istanbul\"\n{}\n[summary]\ntime = \"09:00\"\n",
+            crate::config::tests::base_with_real_hash()
+        ))
+        .unwrap();
+        let s = cfg.summary.clone().unwrap();
+        // 06:00 UTC is 09:00 in Istanbul (+3) but only 06:00 in UTC.
+        let now = Utc.with_ymd_and_hms(2026, 9, 24, 6, 0, 0).unwrap();
+        assert!(should_send(&s, cfg.tz(), now, None).is_some());
+        assert!(should_send(&s, Tz::UTC, now, None).is_none());
     }
 
     #[test]
