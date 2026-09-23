@@ -1,31 +1,22 @@
 {% extends "base.html" %}
 {% block title %}Incidents · {% endblock %}
 {% block content %}
-<div class="page-head">
-  <h1 class="page-title">Incident history</h1>
-  <a class="util-link" href="/feed.xml">{{ site.feed_icon|safe }}Subscribe</a>
-</div>
+<p class="cap"><span>Newest first</span><a href="/feed.xml">Atom feed</a></p>
 {% if months.is_empty() %}
-<div class="panel empty-panel"><p>No incidents recorded.</p></div>
+<p class="quiet">Nothing has been recorded.</p>
 {% endif %}
 {% for month in months %}
-<section class="month">
-  <h2 class="section-title">{{ month.name }}</h2>
-  <ul class="incident-list">
-    {% for inc in month.incidents %}
-    <li class="incident-row s-{{ inc.impact_class }}">
-      <a class="row-title" href="/incidents/{{ inc.id }}">{{ inc.title }}</a>
-      <span class="row-state">{% if inc.resolved.is_some() %}Resolved{% else %}{{ inc.state_label }}{% endif %}</span>
-      <p class="row-meta">
-        <span class="t-{{ inc.impact_class }}">{{ inc.impact_label }}</span> · {{ inc.component }}{% if inc.auto %} · automatic{% endif %}
-      </p>
-      <p class="row-meta num">
-        <time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time>
-        {% if let Some(r) = inc.resolved %}→ <time datetime="{{ r.iso }}" data-local="datetime">{{ r.text }}</time> · {{ inc.duration }}{% else %}· ongoing{% endif %}
-      </p>
-    </li>
-    {% endfor %}
-  </ul>
+<section class="month" aria-labelledby="m-{{ loop.index }}">
+  <h2 class="month-name" id="m-{{ loop.index }}">{{ month.name }}</h2>
+  {% for inc in month.incidents %}
+  <div class="entry">
+    <time class="d" datetime="{{ inc.created.iso }}">{{ inc.day }}</time>
+    <div class="items">
+      <p class="item"><span class="sw s-{{ inc.impact_class }}" aria-hidden="true"></span><a class="t" href="/incidents/{{ inc.id }}">{{ inc.title }}</a> <span class="m">— {% if inc.resolved.is_some() %}Resolved · {{ inc.duration }}{% else %}{{ inc.state_label }} · {{ inc.duration }} so far{% endif %}</span></p>
+      <p class="m sub">{{ inc.component }} · {{ inc.impact_label }}{% if inc.auto %} · opened by a check{% endif %}</p>
+    </div>
+  </div>
+  {% endfor %}
 </section>
 {% endfor %}
 {% endblock %}

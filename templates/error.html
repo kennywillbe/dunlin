@@ -1,12 +1,8 @@
 {% extends "base.html" %}
 {% block title %}{{ heading }} · {% endblock %}
 {% block content %}
-<div class="center">
-  <section class="panel error-card">
-    <p class="error-code num">{{ code }}</p>
-    <h1 class="panel-title">{{ heading }}</h1>
-    <p class="muted">{{ message }}</p>
-    <p><a class="button" href="/">Back to status</a></p>
-  </section>
+<div class="plain-page">
+  <p class="code">{{ code }} · {{ heading }}</p>
+  <p class="back"><a href="/">Back to the status page</a></p>
 </div>
 {% endblock %}

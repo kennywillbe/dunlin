@@ -17,6 +17,7 @@ pub mod notifier;
 pub mod prober;
 pub mod procfs;
 pub mod rollup;
+pub mod sentence;
 pub mod status;
 pub mod summary;
 pub mod systemd;

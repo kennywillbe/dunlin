@@ -245,6 +245,14 @@ pub async fn daily_uptime(pool: &Pool, check_id: &str, from: i64) -> Result<Vec<
         .collect())
 }
 
+/// Time of the newest probe result of any check.
+pub async fn last_result_ts(pool: &Pool) -> Result<Option<i64>> {
+    let row = sqlx::query("SELECT MAX(ts) AS ts FROM check_results")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("ts"))
+}
+
 pub async fn count_results_since(pool: &Pool, from: i64) -> Result<i64> {
     let row = sqlx::query("SELECT COUNT(*) AS n FROM check_results WHERE ts >= ?")
         .bind(from)
@@ -441,6 +449,14 @@ pub async fn incidents_since(pool: &Pool, from: i64) -> Result<Vec<Incident>> {
     Ok(rows.iter().map(row_to_incident).collect())
 }
 
+/// When the most recently closed incident was resolved.
+pub async fn last_resolved_at(pool: &Pool) -> Result<Option<i64>> {
+    let row = sqlx::query("SELECT MAX(resolved_at) AS ts FROM incidents")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("ts"))
+}
+
 pub async fn count_incidents_since(pool: &Pool, from: i64) -> Result<i64> {
     let row = sqlx::query("SELECT COUNT(*) AS n FROM incidents WHERE created_at >= ?")
         .bind(from)
@@ -529,6 +545,18 @@ pub async fn all_maintenance(pool: &Pool) -> Result<Vec<Maintenance>> {
     let rows = sqlx::query("SELECT * FROM maintenance ORDER BY ends_at DESC LIMIT 100")
         .fetch_all(pool)
         .await?;
+    Ok(rows.iter().map(row_to_maintenance).collect())
+}
+
+/// Windows that overlap `[from, to)`, newest first.
+pub async fn maintenance_between(pool: &Pool, from: i64, to: i64) -> Result<Vec<Maintenance>> {
+    let rows = sqlx::query(
+        "SELECT * FROM maintenance WHERE starts_at < ? AND ends_at > ? ORDER BY starts_at DESC",
+    )
+    .bind(to)
+    .bind(from)
+    .fetch_all(pool)
+    .await?;
     Ok(rows.iter().map(row_to_maintenance).collect())
 }
 

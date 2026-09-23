@@ -5,7 +5,9 @@
   "use strict";
 
   var timeFmt = { hour: "2-digit", minute: "2-digit" };
+  var clockFmt = { hour: "2-digit", minute: "2-digit", second: "2-digit" };
   var dateTimeFmt = { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" };
+  var formats = { time: timeFmt, clock: clockFmt, datetime: dateTimeFmt };
 
   function zoneName(d) {
     try {
@@ -23,7 +25,7 @@
       var el = nodes[i];
       var d = new Date(el.getAttribute("datetime"));
       if (isNaN(d)) continue;
-      var text = d.toLocaleString(undefined, el.getAttribute("data-local") === "time" ? timeFmt : dateTimeFmt);
+      var text = d.toLocaleString(undefined, formats[el.getAttribute("data-local")] || dateTimeFmt);
       if (el.hasAttribute("data-zone")) {
         var z = zoneName(d);
         if (z) text += " " + z;

@@ -159,6 +159,8 @@ async fn read_pages_are_public() {
         "/assets/dunlin.js".to_string(),
         "/assets/metrics.js".to_string(),
         "/assets/favicon.svg".to_string(),
+        "/assets/fonts/bricolage-grotesque-latin-800-normal.woff2".to_string(),
+        "/assets/fonts/martian-mono-OFL.txt".to_string(),
         "/metrics?range=7d".to_string(),
     ] {
         let (status, _, _) = send(app.clone(), get(&uri)).await;
@@ -348,8 +350,14 @@ async fn start_and_end_maintenance_window() {
     // The component is shown as under maintenance on the public page...
     let (status, _, body) = send(app.clone(), get("/")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Under maintenance"), "{body}");
-    assert!(body.contains("Maintenance in progress"), "{body}");
+    assert!(
+        body.contains("<em class=\"mnt\">Website</em> is under maintenance until"),
+        "{body}"
+    );
+    assert!(
+        body.contains("Planned disk") || body.contains("upgrade"),
+        "{body}"
+    );
     assert!(
         !body.contains("/maintenance/"),
         "write controls leaked to /"
@@ -520,14 +528,22 @@ async fn status_page_structure() {
         90,
         "one strip of 90 days"
     );
-    assert!(body.contains("100.00% uptime"), "legend uptime");
-    assert!(body.contains("Past incidents"));
-    assert_eq!(body.matches("class=\"day\"").count(), 14);
-    assert!(body.contains("No incidents reported."));
+    assert!(body.contains("100.00%"), "90-day uptime");
+    assert!(body.contains("What happened lately"));
+    assert_eq!(
+        body.matches("<time class=\"d\"").count(),
+        14,
+        "one row per day"
+    );
+    assert!(body.contains("Nothing."));
     assert!(body.contains("Slow pages"));
     assert!(
-        body.contains("Degraded performance"),
-        "banner follows the worst state"
+        body.contains("<h1 class=\"say\"><em class=\"warn\">Website</em> is slow.</h1>"),
+        "the sentence follows the worst state: {body}"
+    );
+    assert!(
+        body.contains("<dt>Open incidents</dt><dd>1</dd>"),
+        "facts list"
     );
 }
 
@@ -599,8 +615,21 @@ async fn unknown_page_is_a_designed_404() {
         .unwrap()
         .starts_with("text/html"));
     assert!(body.contains("Page not found"));
-    let (status, _, _) = send(app, get("/assets/nope.js")).await;
+    assert!(body.contains("There is nothing at /no/such/page."));
+    let (status, _, _) = send(app.clone(), get("/assets/nope.js")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // Fonts come from a fixed list, never from a path on disk.
+    for uri in ["/assets/fonts/nope.woff2", "/assets/fonts/..%2FCargo.toml"] {
+        let (status, _, _) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    let (status, headers, _) = send(
+        app,
+        get("/assets/fonts/martian-mono-latin-400-normal.woff2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "font/woff2");
 }
 
 #[tokio::test]
@@ -661,12 +690,14 @@ async fn favicon_and_default_theme() {
     let (status, headers, body) = send(app.clone(), get("/assets/favicon.svg")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "image/svg+xml");
-    assert!(body.contains("#0f6f73"));
+    assert!(body.contains("#17150f"));
 
     let (_, _, body) = send(app.clone(), get("/")).await;
-    assert!(body.contains("<html lang=\"en\" data-theme=\"auto\">"));
+    // Light only: no theme switch is rendered.
+    assert!(body.contains("<html lang=\"en\">"));
+    assert!(!body.contains("data-theme"));
     assert!(body.contains("<title>Status</title>"));
-    assert!(body.contains("--accent:#0f6f73"));
+    assert!(body.contains("--accent:#17150f"));
     assert!(!body.contains("/assets/custom.css"));
     assert!(!body.contains("/assets/logo"));
 
@@ -684,7 +715,7 @@ async fn configured_theme_applies_everywhere() {
     std::fs::write(dir.path().join("brand.css"), ".banner{border-width:2px}").unwrap();
     let cfg = test_config_with(
         false,
-        "[theme]\ntitle = \"Acme status\"\naccent = \"#7a3cff\"\nmode = \"dark\"\nlogo = \"brand.png\"\ncustom_css = \"brand.css\"\n",
+        "[theme]\ntitle = \"Acme status\"\naccent = \"#7a3cff\"\nlogo = \"brand.png\"\ncustom_css = \"brand.css\"\n",
         dir.path(),
     );
     let (state, _pool) = state_from(cfg).await;
@@ -692,7 +723,6 @@ async fn configured_theme_applies_everywhere() {
 
     for uri in ["/", "/metrics", "/incidents", "/login", "/nope"] {
         let (_, _, body) = send(app.clone(), get(uri)).await;
-        assert!(body.contains("data-theme=\"dark\""), "{uri}");
         assert!(body.contains("Acme status</title>"), "{uri}");
         assert!(body.contains("class=\"brand-title\">Acme status<"), "{uri}");
         assert!(body.contains("href=\"/assets/custom.css\""), "{uri}");
@@ -733,14 +763,13 @@ async fn theme_follows_hot_reload() {
     let hash = dunlin::auth::hash_password(PASSWORD).unwrap();
     std::fs::write(
         &path,
-        format!("listen = \"127.0.0.1:0\"\n[web]\npassword_hash = \"{hash}\"\n[theme]\ntitle = \"Renamed\"\nmode = \"light\"\ncustom_css = \"x.css\"\n"),
+        format!("listen = \"127.0.0.1:0\"\n[web]\npassword_hash = \"{hash}\"\n[theme]\ntitle = \"Renamed\"\ncustom_css = \"x.css\"\n"),
     )
     .unwrap();
     dunlin::app::apply_reload(&path, &tx);
 
     let (_, _, body) = send(app.clone(), get("/")).await;
     assert!(body.contains("<title>Renamed</title>"));
-    assert!(body.contains("data-theme=\"light\""));
     let (status, _, body) = send(app, get("/assets/custom.css")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "body{}");

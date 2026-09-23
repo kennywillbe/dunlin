@@ -1,11 +1,24 @@
+{%- macro parts(list) -%}
+{%- for p in list -%}
+{%- match p -%}
+{%- when Part::Text(t) -%}{{ t }}
+{%- when Part::Name(n, c) -%}<em class="{{ c }}">{{ n }}</em>
+{%- when Part::Strong(t) -%}<b>{{ t }}</b>
+{%- when Part::Time(t) -%}<time datetime="{{ t.iso }}" data-local="time">{{ t.text }}</time>
+{%- when Part::Link(t, href) -%}<a href="{{ href }}">{{ t }}</a>
+{%- endmatch -%}
+{%- endfor -%}
+{%- endmacro -%}
 <!doctype html>
-<html lang="en" data-theme="{{ site.mode }}">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="{% if site.mode == "auto" %}light dark{% else %}{{ site.mode }}{% endif %}">
+<meta name="color-scheme" content="light">
 <title>{% block title %}{% endblock %}{{ site.title }}</title>
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="preload" href="/assets/fonts/bricolage-grotesque-latin-800-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/assets/fonts/bricolage-grotesque-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/style.css">
 <style>{{ site.accent_css|safe }}</style>
 {% block head %}{% endblock %}
@@ -15,8 +28,9 @@
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header class="site-header">
-  <div class="wrap header-row">
+<div class="page"{% block live %}{% endblock %}>
+<aside class="side">
+  <div class="brand-row">
     <a class="brand" href="/">
       {% if site.has_logo %}<img class="brand-logo" src="/assets/logo" alt="">{% else %}{{ site.logo_svg|safe }}{% endif %}
       <span class="brand-title">{{ site.title }}</span>
@@ -25,27 +39,32 @@
       <a href="/"{% if site.section == "status" %} aria-current="page"{% endif %}>Status</a>
       <a href="/metrics"{% if site.section == "metrics" %} aria-current="page"{% endif %}>Metrics</a>
       <a href="/incidents"{% if site.section == "incidents" %} aria-current="page"{% endif %}>Incidents</a>
+      {% if site.logged_in %}<a href="/manage"{% if site.section == "manage" %} aria-current="page"{% endif %}>Manage</a>{% endif %}
     </nav>
-    <div class="utility">
-      <a class="util-link" href="/feed.xml" title="Atom feed of incidents">{{ site.feed_icon|safe }}<span class="util-text">Feed</span></a>
-      {% if site.logged_in %}
-      <a class="util-link" href="/manage"{% if site.section == "manage" %} aria-current="page"{% endif %}>Manage</a>
-      <form method="post" action="/logout" class="inline"><button type="submit" class="link-button">Log out</button></form>
-      {% else %}
-      <a class="util-link" href="/login"{% if site.section == "login" %} aria-current="page"{% endif %}>Log in</a>
-      {% endif %}
-    </div>
   </div>
-</header>
-<main id="main" class="wrap">
+  <div class="say-block" aria-live="polite">
+    <h1 class="say">{% call parts(side.say.headline) %}{% endcall %}</h1>
+    {% if !side.say.detail.is_empty() %}<p class="detail">{% call parts(side.say.detail) %}{% endcall %}</p>{% endif %}
+  </div>
+  {% if let Some(f) = side.facts %}
+  <dl class="facts">
+    {% if let Some(t) = f.checked %}<dt>Checked</dt><dd><time datetime="{{ t.iso }}" data-local="clock">{{ t.text }}</time></dd>{% endif %}
+    {% if let Some(e) = f.every %}<dt>Every</dt><dd>{{ e }}</dd>{% endif %}
+    <dt>Watching</dt><dd>{{ f.watching }}</dd>
+    <dt>Open incidents</dt><dd>{{ f.open }}</dd>
+  </dl>
+  {% endif %}
+  <div class="side-foot">
+    <a href="/feed.xml">Atom feed</a>
+    {% if site.logged_in %}<form method="post" action="/logout" class="inline"><button type="submit" class="link-button">Log out</button></form>
+    {% else %}<a href="/login"{% if site.section == "login" %} aria-current="page"{% endif %}>Log in</a>{% endif %}
+    <span>Runs on dunlin</span>
+  </div>
+</aside>
+<main id="main" class="data">
 {% block content %}{% endblock %}
 </main>
-<footer class="site-footer">
-  <div class="wrap footer-row">
-    <span>Powered by dunlin</span>
-    <span class="footer-links"><a href="/incidents">Incident history</a> · <a href="/feed.xml">Atom feed</a></span>
-  </div>
-</footer>
+</div>
 {% block scripts %}{% endblock %}
 </body>
 </html>

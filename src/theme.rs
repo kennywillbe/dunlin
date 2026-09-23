@@ -2,20 +2,24 @@
 
 use anyhow::{bail, Result};
 
-/// Default accent: a deep estuary teal.
-pub const DEFAULT_ACCENT: &str = "#0f6f73";
+/// Default accent: the ink colour, so an unconfigured page has no colour
+/// except where something is wrong.
+pub const DEFAULT_ACCENT: &str = "#17150f";
 
-/// The dunlin mark: a plump shorebird with a long, slightly down-curved bill.
-/// Single colour through `currentColor` so it follows the accent; the eye is a
-/// hole (even-odd fill) rather than a second colour for the same reason.
-pub const LOGO_SVG: &str = r#"<svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path fill="currentColor" fill-rule="evenodd" d="M7.8 12.3C8 10 9.5 8.8 11.5 8.8c2.5 0 4 1.7 5.5 3.2 5 0 10.5 1.5 14 4.5-2.5 1-4.5 2-6 3-2.5 4.5-9 6-12.5 4-2.5-1.5-3.9-4.5-3.7-7.5 0-.8-.4-1.4-.8-1.7-3.8.7-6.6 5.3-6.6 5.3.6-3.4 2.2-6.9 6.2-7.3zM10.1 11.6a.9.9 0 1 0 1.8 0 .9.9 0 1 0-1.8 0z"/><path d="M15 24.3l-1 5.2M18.2 24.3l.4 5.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" fill="none"/></svg>"#;
+/// Ink colour of the paper theme; must match `--ink` in style.css.
+pub const INK: &str = "#17150f";
 
-/// Favicon with the accent baked in; browsers do not apply page CSS to icons.
-pub fn favicon_svg(accent: &str) -> String {
+/// The dunlin mark: a round shorebird with a long bill, on two thin legs.
+/// Single colour through `currentColor`; the eye is a hole (even-odd fill)
+/// rather than a second colour so the mark works on any background.
+pub const LOGO_SVG: &str = r#"<svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path fill="currentColor" fill-rule="evenodd" d="M4 18.5c0-5 4-8.2 9.2-8.2 3 0 5.2 1.1 6.3 3.1l9.5 3.6-9.4-.6c-1.2 3-4.2 4.9-8.3 4.9-4.3 0-7.3-1-7.3-2.8zM16.1 13.8a1.1 1.1 0 1 0 2.2 0 1.1 1.1 0 1 0-2.2 0z"/><path d="M11.5 23.3l-.8 5.2M15.5 23.2l.6 5.3" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>"#;
+
+/// Favicon in ink; browsers do not apply page CSS to icons.
+pub fn favicon_svg() -> String {
     LOGO_SVG
         .replace(r#" class="mark""#, r#" xmlns="http://www.w3.org/2000/svg""#)
         .replace(r#" aria-hidden="true" focusable="false""#, "")
-        .replace("currentColor", accent)
+        .replace("currentColor", INK)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,43 +66,38 @@ pub fn parse_hex(s: &str) -> Result<Rgb> {
     Ok(Rgb(p(1), p(3), p(5)))
 }
 
-const WHITE: Rgb = Rgb(255, 255, 255);
-const BLACK: Rgb = Rgb(0, 0, 0);
-/// Surfaces the accent is drawn on; must match `--surface` in style.css.
-const LIGHT_SURFACE: Rgb = Rgb(255, 255, 255);
-const DARK_SURFACE: Rgb = Rgb(0x16, 0x1c, 0x23);
+const PAPER: Rgb = Rgb(0xf1, 0xf0, 0xec);
+const INK_RGB: Rgb = Rgb(0x17, 0x15, 0x0f);
 
-/// Step the colour towards `target` until it reaches 4.5:1 against `bg`, so any
-/// configured accent still gives readable links in both themes.
-fn ensure_contrast(c: Rgb, bg: Rgb, target: Rgb) -> Rgb {
+/// Step the colour towards ink until it reaches 4.5:1 against the paper, so
+/// any configured accent still gives readable links.
+fn ensure_contrast(c: Rgb) -> Rgb {
     let mut t = 0.0;
     let mut out = c;
-    while contrast(out, bg) < 4.5 && t < 1.0 {
+    while contrast(out, PAPER) < 4.5 && t < 1.0 {
         t += 0.05;
-        out = c.mix(target, t);
+        out = c.mix(INK_RGB, t);
     }
     out
 }
 
 /// Text colour for solid accent backgrounds (buttons).
 fn ink_for(bg: Rgb) -> Rgb {
-    if contrast(WHITE, bg) >= contrast(Rgb(0x0b, 0x12, 0x18), bg) {
-        WHITE
+    if contrast(PAPER, bg) >= contrast(INK_RGB, bg) {
+        PAPER
     } else {
-        Rgb(0x0b, 0x12, 0x18)
+        INK_RGB
     }
 }
 
-/// CSS custom properties for the accent in light and dark mode.
+/// CSS custom properties for the accent.
 pub fn accent_css(accent: &str) -> String {
-    let base = parse_hex(accent).unwrap_or(Rgb(0x0f, 0x6f, 0x73));
-    let light = ensure_contrast(base, LIGHT_SURFACE, BLACK);
-    let dark = ensure_contrast(base, DARK_SURFACE, WHITE);
-    let vars = |c: Rgb| format!("--accent:{};--accent-ink:{};", c.hex(), ink_for(c).hex());
+    let base = parse_hex(accent).unwrap_or(INK_RGB);
+    let c = ensure_contrast(base);
     format!(
-        ":root{{{l}}}:root[data-theme=dark]{{{d}}}@media (prefers-color-scheme:dark){{:root[data-theme=auto]{{{d}}}}}",
-        l = vars(light),
-        d = vars(dark),
+        ":root{{--accent:{};--accent-ink:{};}}",
+        c.hex(),
+        ink_for(c).hex()
     )
 }
 
@@ -116,22 +115,24 @@ mod tests {
     }
 
     #[test]
-    fn accent_is_readable_in_both_modes() {
-        // A very light accent must be darkened for light mode and kept for dark.
-        let css = accent_css("#f0f0a0");
-        assert!(css.contains("data-theme=dark"));
+    fn accent_is_readable_on_paper() {
+        assert_eq!(
+            accent_css(DEFAULT_ACCENT),
+            ":root{--accent:#17150f;--accent-ink:#f1f0ec;}"
+        );
         for accent in ["#0f6f73", "#f0f0a0", "#101010", "#ff0000"] {
-            let base = parse_hex(accent).unwrap();
-            assert!(contrast(ensure_contrast(base, LIGHT_SURFACE, BLACK), LIGHT_SURFACE) >= 4.5);
-            assert!(contrast(ensure_contrast(base, DARK_SURFACE, WHITE), DARK_SURFACE) >= 4.5);
+            let c = ensure_contrast(parse_hex(accent).unwrap());
+            assert!(contrast(c, PAPER) >= 4.5, "{accent}");
         }
+        // A light accent is darkened rather than used as is.
+        assert!(!accent_css("#f0f0a0").contains("#f0f0a0"));
     }
 
     #[test]
-    fn favicon_uses_accent() {
-        let svg = favicon_svg("#123456");
+    fn favicon_is_ink() {
+        let svg = favicon_svg();
         assert!(svg.contains("xmlns=\"http://www.w3.org/2000/svg\""));
-        assert!(svg.contains("#123456"));
+        assert!(svg.contains(INK));
         assert!(!svg.contains("currentColor"));
     }
 }

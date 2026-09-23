@@ -1,33 +1,24 @@
 {% extends "base.html" %}
 {% block title %}{{ incident.title }} · {% endblock %}
 {% block content %}
-<p class="crumb"><a href="/incidents">Incidents</a></p>
-<header class="incident-header">
-  <h1 class="page-title">{{ incident.title }}</h1>
-  <div class="incident-facts">
-    <span class="badge s-{{ incident.impact_class }}">{{ impact_icon|safe }}{{ incident.impact_label }}</span>
-    <span>{{ incident.component }}</span>
-    {% if incident.resolved.is_some() %}<span>Resolved after {{ incident.duration }}</span>{% else %}<span>Ongoing for {{ incident.duration }}</span>{% endif %}
-    {% if incident.auto %}<span>Opened automatically</span>{% endif %}
-  </div>
-</header>
+<p class="cap"><a href="/incidents">All incidents</a><span></span></p>
+<p class="meta"><span class="sw s-{{ incident.impact_class }}" aria-hidden="true"></span>{{ incident.component }} · {{ incident.impact_label }} · opened <time datetime="{{ incident.created.iso }}" data-local="datetime">{{ incident.created.text }}</time>{% if incident.resolved.is_some() %} · resolved after {{ incident.duration }}{% else %} · open {{ incident.duration }}{% endif %}{% if incident.auto %} · opened by a check{% endif %}</p>
 
 <ol class="timeline">
   {% for u in updates %}
-  <li class="entry i-{{ u.state_class }}">
-    <h2 class="entry-state">{{ u.state_label }}</h2>
-    <p class="entry-message">{{ u.message }}</p>
-    <p class="entry-time"><time datetime="{{ u.ts.iso }}" data-local="datetime">{{ u.ts.text }}</time></p>
+  <li class="entry">
+    <time class="d" datetime="{{ u.ts.iso }}" data-local="datetime">{{ u.ts.text }}</time>
+    <p class="update"><strong class="st i-{{ u.state_class }}">{{ u.state_label }}</strong> {{ u.message }}</p>
   </li>
   {% endfor %}
 </ol>
 
 {% if site.logged_in %}
-<section class="panel form-panel" aria-labelledby="post-update">
-  <h2 id="post-update" class="panel-title">Post an update</h2>
+<section class="form-section" aria-labelledby="post-update">
+  <h2 id="post-update" class="form-title">Post an update</h2>
   <form method="post" action="/incidents/{{ incident.id }}/updates" class="form">
     <div class="field">
-      <label for="u-state">Status</label>
+      <label for="u-state">State</label>
       <select id="u-state" name="state">
         <option value="investigating">Investigating</option>
         <option value="identified">Identified</option>
@@ -39,13 +30,11 @@
       <label for="u-message">Message</label>
       <textarea id="u-message" name="message" rows="3" required></textarea>
     </div>
-    <div class="actions">
-      <button class="button primary" type="submit">Post update</button>
-    </div>
+    <div class="actions"><button class="button primary" type="submit">Post update</button></div>
   </form>
   {% if incident.resolved.is_none() %}
   <form method="post" action="/incidents/{{ incident.id }}/resolve" class="resolve-form">
-    <p class="muted">Resolving closes the incident and adds a final "Resolved" entry.</p>
+    <p class="soft">Resolving closes the incident and adds a final "Resolved" entry.</p>
     <button class="button" type="submit">Resolve incident</button>
   </form>
   {% endif %}

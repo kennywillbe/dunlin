@@ -63,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/feed.xml", get(feed))
         .route("/health", get(health))
         .route("/assets/{file}", get(asset))
+        .route("/assets/fonts/{file}", get(font))
         .route("/hb/{token}", get(heartbeat).post(heartbeat))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
@@ -85,12 +86,12 @@ fn render<T: Template>(template: &T) -> Response {
     }
 }
 
-fn error_page(cfg: &Config, status: StatusCode, heading: &str, message: &str) -> Response {
+fn error_page(cfg: &Config, status: StatusCode, heading: &str, side: SideView) -> Response {
     let page = ErrorTemplate {
         site: SiteView::new(cfg, false, ""),
+        side,
         code: status.as_u16(),
         heading: heading.to_string(),
-        message: message.to_string(),
     };
     (status, render(&page)).into_response()
 }
@@ -101,16 +102,27 @@ fn internal(state: &AppState, err: impl std::fmt::Display) -> Response {
         &state.cfg(),
         StatusCode::INTERNAL_SERVER_ERROR,
         "Something went wrong",
-        "The server could not complete this request. The error has been logged.",
+        SideView::plain(
+            "Something broke on this side.",
+            "The error has been logged. Trying again in a minute may work.",
+        ),
     )
 }
 
-async fn not_found(State(state): State<AppState>) -> Response {
+async fn not_found(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+    // Long junk paths would push the sentence off the screen.
+    let mut path: String = uri.path().chars().take(60).collect();
+    if uri.path().chars().count() > 60 {
+        path.push('…');
+    }
     error_page(
         &state.cfg(),
         StatusCode::NOT_FOUND,
         "Page not found",
-        "There is nothing at this address.",
+        SideView::plain(
+            &format!("There is nothing at {path}."),
+            "The address may be old or mistyped.",
+        ),
     )
 }
 
@@ -196,6 +208,46 @@ async fn incident_views(
 /// How many days of history the status page lists, as on Statuspage.
 const PAST_DAYS: i64 = 14;
 
+/// Window of the tick strips.
+const STRIP_DAYS: i64 = 90;
+
+fn fmt_every(secs: u64) -> String {
+    if secs < 120 || !secs.is_multiple_of(60) {
+        format!("{secs} s")
+    } else {
+        format!("{} min", secs / 60)
+    }
+}
+
+/// The mono facts at the foot of the left column.
+async fn facts(pool: &Pool, cfg: &Config) -> FactsView {
+    let n = cfg.components.len();
+    FactsView {
+        checked: db::last_result_ts(pool)
+            .await
+            .ok()
+            .flatten()
+            .map(TimeView::clock),
+        // Heartbeats are pushed to us, so their period is not a check rate.
+        every: cfg
+            .checks
+            .iter()
+            .filter(|c| c.kind != CheckType::Heartbeat)
+            .map(|c| c.interval.as_secs())
+            .min()
+            .map(fmt_every),
+        watching: if n == 1 {
+            "1 thing".to_string()
+        } else {
+            format!("{n} things")
+        },
+        open: db::active_incidents(pool)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0),
+    }
+}
+
 async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response {
     if let Some(r) = read_guard(&state, &jar).await {
         return r;
@@ -207,12 +259,17 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
     let windows = db::current_and_upcoming_maintenance(&state.pool, now)
         .await
         .unwrap_or_default();
-    let active_windows: Vec<_> = windows
-        .iter()
-        .filter(|m| m.starts_at <= now)
-        .cloned()
-        .collect();
     let active = db::active_incidents(&state.pool).await.unwrap_or_default();
+    let today = now.div_euclid(86_400) * 86_400;
+    let strip_from = today - (STRIP_DAYS - 1) * 86_400;
+    let history = History {
+        incidents: db::incidents_since(&state.pool, strip_from)
+            .await
+            .unwrap_or_default(),
+        maintenance: db::maintenance_between(&state.pool, strip_from, now + 1)
+            .await
+            .unwrap_or_default(),
+    };
 
     // Group components; components without a group land in "Other".
     let mut group_names: Vec<(String, String)> = cfg
@@ -223,6 +280,7 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
     group_names.push(("__other".to_string(), "Other".to_string()));
 
     let mut groups: Vec<GroupView> = Vec::new();
+    let mut snapshots = Vec::new();
     for (gid, gname) in &group_names {
         let members: Vec<_> = cfg
             .components
@@ -238,9 +296,10 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
         }
         let mut components = Vec::new();
         for comp in members {
-            components.push(
-                build_component(&state.pool, &cfg, comp, &active_windows, &active, now).await,
-            );
+            let (view, snap) =
+                build_component(&state.pool, &cfg, comp, &windows, &active, &history, now).await;
+            components.push(view);
+            snapshots.push(snap);
         }
         groups.push(GroupView {
             name: gname.clone(),
@@ -248,55 +307,133 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
         });
     }
 
-    let overall = status::overall(groups.iter().flat_map(|g| {
-        g.components
-            .iter()
-            .filter_map(|c| CompState::from_name(&c.state_class))
-    }));
-    let overall_label = match overall {
-        CompState::Operational => "All systems operational",
-        CompState::Maintenance => "Maintenance in progress",
-        CompState::Degraded => "Degraded performance",
-        CompState::PartialOutage => "Partial outage",
-        CompState::MajorOutage => "Major outage",
+    // The detail leads with the worst open incident, newest first on ties.
+    let lead = active
+        .iter()
+        .max_by_key(|i| (i.impact, i.created_at))
+        .map(|i| i.id);
+    let incident = match lead {
+        Some(id) => Some(crate::sentence::OpenIncident {
+            id,
+            message: db::last_update_message(&state.pool, id)
+                .await
+                .ok()
+                .flatten(),
+        }),
+        None => None,
     };
-
-    let active_views = incident_views(&state.pool, &cfg, &active, now).await;
-
-    let today = now.div_euclid(86_400) * 86_400;
-    let since = today - (PAST_DAYS - 1) * 86_400;
-    let past = db::incidents_since(&state.pool, since)
-        .await
-        .unwrap_or_default();
-    let past_views = incident_views(&state.pool, &cfg, &past, now).await;
-    let past_days = (0..PAST_DAYS)
-        .map(|offset| {
-            let day = today - offset * 86_400;
-            DayView {
-                heading: fmt_day(day),
-                incidents: past
-                    .iter()
-                    .zip(&past_views)
-                    .filter(|(i, _)| i.created_at.div_euclid(86_400) * 86_400 == day)
-                    .map(|(_, v)| v.clone())
-                    .collect(),
-            }
+    let upcoming: Vec<crate::sentence::Upcoming> = windows
+        .iter()
+        .filter(|m| m.starts_at > now)
+        .map(|m| crate::sentence::Upcoming {
+            component: component_name(&cfg, &m.component),
+            starts: m.starts_at,
         })
         .collect();
+    let say = crate::sentence::status_say(&crate::sentence::StatusFacts {
+        components: &snapshots,
+        incident,
+        last_resolved: db::last_resolved_at(&state.pool).await.ok().flatten(),
+        upcoming: &upcoming,
+        now,
+    });
+
+    let past_from = today - (PAST_DAYS - 1) * 86_400;
+    let past_days = past_days(&cfg, &history, past_from, today, now);
 
     render(&StatusTemplate {
         site: SiteView::new(&cfg, logged_in, "status"),
-        overall_class: overall.as_str().to_string(),
-        overall_label: overall_label.to_string(),
-        overall_icon: state_icon(overall),
-        updated: TimeView::time(now),
-        active_incidents: active_views,
-        maintenance: maintenance_views(&cfg, &windows, now),
+        side: SideView {
+            say,
+            facts: Some(facts(&state.pool, &cfg).await),
+        },
         groups,
         past_days,
         info_icon: ICON_INFO,
-        wrench_icon: ICON_WRENCH,
     })
+}
+
+/// Incidents and maintenance of the strip window, fetched once per page.
+struct History {
+    incidents: Vec<crate::models::Incident>,
+    maintenance: Vec<crate::models::Maintenance>,
+}
+
+/// "What happened lately": one row per day, newest first.
+fn past_days(cfg: &Config, h: &History, from: i64, today: i64, now: i64) -> Vec<DayView> {
+    let day_of = |ts: i64| ts.div_euclid(86_400) * 86_400;
+    let mut days = Vec::new();
+    let mut day = today;
+    while day >= from {
+        let mut items: Vec<(i64, PastItem)> = h
+            .incidents
+            .iter()
+            .filter(|i| day_of(i.created_at) == day)
+            .map(|i| {
+                let note = match i.resolved_at {
+                    Some(r) => format!("Resolved · {}", human_duration(r - i.created_at)),
+                    None => i.state.label().to_string(),
+                };
+                (
+                    i.created_at,
+                    PastItem {
+                        href: Some(format!("/incidents/{}", i.id)),
+                        title: i.title.clone(),
+                        swatch: i.impact.as_str().to_string(),
+                        note,
+                    },
+                )
+            })
+            .collect();
+        items.extend(
+            h.maintenance
+                .iter()
+                .filter(|m| day_of(m.starts_at) == day && m.starts_at <= now)
+                .map(|m| {
+                    let title = if m.note.trim().is_empty() {
+                        format!("Maintenance on {}", component_name(cfg, &m.component))
+                    } else {
+                        m.note.clone()
+                    };
+                    let note = if m.ends_at <= now {
+                        format!("Completed · {}", human_duration(m.ends_at - m.starts_at))
+                    } else {
+                        "In progress".to_string()
+                    };
+                    (
+                        m.starts_at,
+                        PastItem {
+                            href: None,
+                            title,
+                            swatch: CompState::Maintenance.as_str().to_string(),
+                            note,
+                        },
+                    )
+                }),
+        );
+        items.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+        days.push(DayView {
+            heading: fmt_short_day(day),
+            iso: iso8601(day)[..10].to_string(),
+            items: items.into_iter().map(|(_, i)| i).collect(),
+        });
+        day -= 86_400;
+    }
+    days
+}
+
+fn kind_word(kind: CheckType) -> &'static str {
+    match kind {
+        CheckType::Http => "http",
+        CheckType::Tcp => "tcp",
+        CheckType::Systemd => "systemd",
+        CheckType::Docker => "container",
+        CheckType::Disk => "disk",
+        CheckType::Ram => "memory",
+        CheckType::Swap => "swap",
+        CheckType::Load => "load",
+        CheckType::Heartbeat => "heartbeat",
+    }
 }
 
 async fn build_component(
@@ -305,44 +442,110 @@ async fn build_component(
     comp: &crate::config::ComponentConfig,
     maintenance: &[crate::models::Maintenance],
     active: &[crate::models::Incident],
+    history: &History,
     now: i64,
-) -> ComponentView {
+) -> (ComponentView, crate::sentence::Snapshot) {
     let check = comp.check.as_ref().and_then(|id| cfg.check(id));
 
-    let (base, daily) = match check {
+    let (base, daily, last) = match check {
         Some(check) => {
             let last = db::last_check_result(pool, &check.id).await.ok().flatten();
             let failures = db::consecutive_failures(pool, &check.id, check.failures_to_open as i64)
                 .await
                 .unwrap_or(0);
             let base = status::check_state(last.as_ref(), failures, check.failures_to_open);
-            let daily = db::daily_uptime(pool, &check.id, now - 90 * 86_400)
+            let daily = db::daily_uptime(pool, &check.id, now - STRIP_DAYS * 86_400)
                 .await
                 .unwrap_or_default();
-            (base, daily)
+            (base, daily, last)
         }
-        None => (CompState::Operational, Vec::new()),
+        None => (CompState::Operational, Vec::new(), None),
     };
     let total: i64 = daily.iter().map(|(_, t, _)| t).sum();
     let up: i64 = daily.iter().map(|(_, _, u)| u).sum();
     let uptime_90 = (total > 0).then(|| format_pct(up as f64 / total as f64 * 100.0));
 
-    let in_maintenance = maintenance.iter().any(|m| m.covers(&comp.id, now));
-    let impact = active
+    let window = maintenance.iter().find(|m| m.covers(&comp.id, now));
+    let mine: Vec<&crate::models::Incident> =
+        active.iter().filter(|i| i.component == comp.id).collect();
+    let impact = mine.iter().map(|i| i.impact).max();
+    let state = status::component_state(base, window.is_some(), impact);
+    let since = mine.iter().map(|i| i.created_at).min();
+    let latency = last.as_ref().and_then(|r| r.latency_ms);
+
+    let (sub, sub_class) = match state {
+        CompState::Operational => (
+            match (check, latency) {
+                (Some(c), Some(ms)) if matches!(c.kind, CheckType::Http | CheckType::Tcp) => {
+                    crate::sentence::fmt_latency(ms)
+                }
+                (Some(c), _) => kind_word(c.kind).to_string(),
+                (None, _) => "manual".to_string(),
+            },
+            "",
+        ),
+        CompState::MajorOutage => (
+            match since {
+                Some(t) => format!("Down · {}", human_duration(now - t)),
+                None => "Down".to_string(),
+            },
+            "down",
+        ),
+        CompState::PartialOutage => ("Having trouble".to_string(), "bad"),
+        CompState::Degraded => (
+            match latency {
+                _ if check.is_some_and(|c| {
+                    matches!(
+                        c.kind,
+                        CheckType::Disk | CheckType::Ram | CheckType::Swap | CheckType::Load
+                    )
+                }) =>
+                {
+                    "Running high".to_string()
+                }
+                Some(ms) => format!("Slow · {}", crate::sentence::fmt_latency(ms)),
+                None => "Slow".to_string(),
+            },
+            "warn",
+        ),
+        CompState::Maintenance => ("Maintenance".to_string(), "mnt"),
+    };
+
+    let incidents: Vec<&crate::models::Incident> = history
+        .incidents
         .iter()
         .filter(|i| i.component == comp.id)
-        .map(|i| i.impact)
-        .max();
-    let state = status::component_state(base, in_maintenance, impact);
+        .collect();
+    let windows: Vec<&crate::models::Maintenance> = history
+        .maintenance
+        .iter()
+        .filter(|m| m.component == comp.id || m.component.is_empty())
+        .collect();
 
-    ComponentView {
+    let view = ComponentView {
         name: comp.name.clone(),
         description: comp.description.clone(),
         state_class: state.as_str().to_string(),
         state_label: state.label().to_string(),
+        sub,
+        sub_class,
         uptime_90,
-        bars: build_bars(&daily, now),
-    }
+        bars: build_bars(&daily, &incidents, &windows, now),
+    };
+    let snap = crate::sentence::Snapshot {
+        name: comp.name.clone(),
+        state,
+        since,
+        latency_ms: latency,
+        maintenance_until: window.map(|m| m.ends_at),
+        resource: check.is_some_and(|c| {
+            matches!(
+                c.kind,
+                CheckType::Disk | CheckType::Ram | CheckType::Swap | CheckType::Load
+            )
+        }),
+    };
+    (view, snap)
 }
 
 /// Two decimals, but never round a day with downtime up to a clean 100%.
@@ -355,7 +558,7 @@ fn format_pct(p: f64) -> String {
     }
 }
 
-/// The day's colour: the worst state its uptime implies.
+/// The worst state a day's uptime implies.
 fn day_state(uptime: f64) -> CompState {
     if uptime >= 99.99 {
         CompState::Operational
@@ -368,30 +571,64 @@ fn day_state(uptime: f64) -> CompState {
     }
 }
 
-fn build_bars(daily: &[(i64, i64, i64)], now: i64) -> Vec<BarView> {
-    status::uptime_bars(daily, 90, now)
+/// One tick per day. An incident counts for every day it was open, so a
+/// manual incident shows even when the probes kept passing; maintenance only
+/// shows on a day that had nothing worse.
+fn build_bars(
+    daily: &[(i64, i64, i64)],
+    incidents: &[&crate::models::Incident],
+    windows: &[&crate::models::Maintenance],
+    now: i64,
+) -> Vec<BarView> {
+    status::uptime_bars(daily, STRIP_DAYS, now)
         .into_iter()
         .map(|b| {
             let date = fmt_day(b.day);
-            match b.uptime {
+            let end = b.day + 86_400;
+            let impact = incidents
+                .iter()
+                .filter(|i| i.created_at < end && i.resolved_at.unwrap_or(now) >= b.day)
+                .map(|i| i.impact)
+                .filter(|s| *s != CompState::Maintenance)
+                .max();
+            let maint = windows
+                .iter()
+                .any(|m| m.starts_at < end && m.ends_at > b.day);
+            let from_uptime = b.uptime.map(day_state);
+            let state = match (from_uptime, impact) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            let state = match state {
+                Some(CompState::Operational) | None if maint => Some(CompState::Maintenance),
+                s => s,
+            };
+            let uptime = b
+                .uptime
+                .map(|u| format!("{}%", format_pct(u)))
+                .unwrap_or_default();
+            match state {
                 None => BarView {
                     class: "empty".to_string(),
                     aria: format!("{date}: no data"),
                     date,
-                    uptime: String::new(),
+                    uptime,
                     label: "No data".to_string(),
                 },
-                Some(u) => {
-                    let state = day_state(u);
-                    let label = if state == CompState::Operational {
-                        "No downtime".to_string()
-                    } else {
-                        state.label().to_string()
+                Some(state) => {
+                    let label = match state {
+                        CompState::Operational => "Nothing went wrong".to_string(),
+                        CompState::Maintenance => "Maintenance".to_string(),
+                        s => s.label().to_string(),
                     };
-                    let uptime = format!("{}%", format_pct(u));
+                    let aria = if uptime.is_empty() {
+                        format!("{date}: {}", label.to_lowercase())
+                    } else {
+                        format!("{date}: {uptime} uptime, {}", label.to_lowercase())
+                    };
                     BarView {
                         class: state.as_str().to_string(),
-                        aria: format!("{date}: {uptime} uptime, {}", label.to_lowercase()),
+                        aria,
                         date,
                         uptime,
                         label,
@@ -431,12 +668,68 @@ async fn metrics_page(
     let cards_json = serde_json::to_string(&cards)
         .unwrap_or_else(|_| "[]".to_string())
         .replace("</", "<\\/");
+    let say = crate::sentence::host_say(&host_metrics(&state.pool, &cfg).await);
+    let has_lines = cards.iter().any(|c| c.threshold.is_some());
     render(&MetricsTemplate {
         site: SiteView::new(&cfg, logged_in, "metrics"),
+        side: SideView {
+            say,
+            facts: Some(facts(&state.pool, &cfg).await),
+        },
         range: valid_range(q.range.as_deref()).to_string(),
+        has_lines,
         sections,
         cards_json,
     })
+}
+
+/// Percent at which a host number counts as trouble when no check says so.
+const DEFAULT_HOST_WARN: f64 = 90.0;
+
+/// The `warn` of the first resource check of `kind` (and `mount` for disks).
+fn resource_warn(cfg: &Config, kind: CheckType, mount: Option<&str>) -> Option<f64> {
+    cfg.checks
+        .iter()
+        .filter(|c| c.kind == kind)
+        .filter(|c| mount.is_none() || c.mount.as_deref() == mount)
+        .find_map(|c| c.warn)
+}
+
+/// Latest CPU, memory and disk numbers for the host sentence.
+async fn host_metrics(pool: &Pool, cfg: &Config) -> Vec<crate::sentence::HostMetric> {
+    use crate::sentence::{HostKind, HostMetric};
+    let mut out = Vec::new();
+    let latest = |metric: &'static str, key: String| async move {
+        db::latest_sample(pool, "host", metric, &key)
+            .await
+            .ok()
+            .flatten()
+    };
+    if let Some(v) = latest("cpu_pct", String::new()).await {
+        out.push(HostMetric {
+            kind: HostKind::Cpu,
+            value: v,
+            warn: DEFAULT_HOST_WARN,
+        });
+    }
+    if let Some(v) = latest("mem_pct", String::new()).await {
+        out.push(HostMetric {
+            kind: HostKind::Memory,
+            value: v,
+            warn: resource_warn(cfg, CheckType::Ram, None).unwrap_or(DEFAULT_HOST_WARN),
+        });
+    }
+    let mounts: BTreeSet<String> = configured_mounts(cfg).into_iter().collect();
+    for m in mounts {
+        if let Some(v) = latest("disk_used_pct", m.clone()).await {
+            out.push(HostMetric {
+                warn: resource_warn(cfg, CheckType::Disk, Some(&m)).unwrap_or(DEFAULT_HOST_WARN),
+                kind: HostKind::Disk(m),
+                value: v,
+            });
+        }
+    }
+    out
 }
 
 fn one(label: &str, scope: &str, metric: &str, key: &str) -> CardSeries {
@@ -449,11 +742,16 @@ fn one(label: &str, scope: &str, metric: &str, key: &str) -> CardSeries {
     }
 }
 
+/// Title, series and the trouble line of one chart.
+type Card = (String, Vec<CardSeries>, Option<f64>);
+
 /// Chart cards per section: host metrics, one card per container seen in the
 /// data, and latency for every HTTP/TCP check in the config.
 async fn build_sections(pool: &Pool, cfg: &Config) -> Vec<SectionView> {
     let known = db::distinct_series(pool).await.unwrap_or_default();
 
+    let latency_line =
+        |c: &crate::config::CheckConfig| c.latency_degraded.map(|d| d.as_secs_f64() * 1000.0);
     let mut host = vec![
         ("CPU", vec![one("CPU", "host", "cpu_pct", "")]),
         ("Memory", vec![one("Memory", "host", "mem_pct", "")]),
@@ -478,10 +776,23 @@ async fn build_sections(pool: &Pool, cfg: &Config) -> Vec<SectionView> {
         .into_iter()
         .map(|m| (format!("Disk {m}"), m))
         .collect();
-    let mut host_cards: Vec<(String, Vec<CardSeries>)> =
-        host.drain(..).map(|(t, s)| (t.to_string(), s)).collect();
+    let line_for = |title: &str| match title {
+        "Memory" => resource_warn(cfg, CheckType::Ram, None),
+        "Swap" => resource_warn(cfg, CheckType::Swap, None),
+        "Load average" => resource_warn(cfg, CheckType::Load, None),
+        _ => None,
+    };
+    let mut host_cards: Vec<Card> = host
+        .drain(..)
+        .map(|(t, s)| (t.to_string(), s, line_for(t)))
+        .collect();
     for (title, mount) in disk_titles {
-        host_cards.push((title, vec![one("Used", "host", "disk_used_pct", &mount)]));
+        let line = resource_warn(cfg, CheckType::Disk, Some(&mount));
+        host_cards.push((
+            title,
+            vec![one("Used", "host", "disk_used_pct", &mount)],
+            line,
+        ));
     }
     host_cards.push((
         "Network".to_string(),
@@ -489,6 +800,7 @@ async fn build_sections(pool: &Pool, cfg: &Config) -> Vec<SectionView> {
             one("In", "host", "net_rx_bps", ""),
             one("Out", "host", "net_tx_bps", ""),
         ],
+        None,
     ));
 
     let containers: BTreeSet<String> = known
@@ -496,7 +808,7 @@ async fn build_sections(pool: &Pool, cfg: &Config) -> Vec<SectionView> {
         .filter(|(s, m, _)| s == "container" && m == "cpu_pct")
         .map(|(_, _, k)| k.clone())
         .collect();
-    let container_cards: Vec<(String, Vec<CardSeries>)> = containers
+    let container_cards: Vec<Card> = containers
         .into_iter()
         .map(|name| {
             let mut mem = one("Memory", "container", "mem_bytes", &name);
@@ -504,11 +816,12 @@ async fn build_sections(pool: &Pool, cfg: &Config) -> Vec<SectionView> {
             (
                 name.clone(),
                 vec![one("CPU", "container", "cpu_pct", &name), mem],
+                None,
             )
         })
         .collect();
 
-    let check_cards: Vec<(String, Vec<CardSeries>)> = cfg
+    let check_cards: Vec<Card> = cfg
         .checks
         .iter()
         .filter(|c| matches!(c.kind, CheckType::Http | CheckType::Tcp))
@@ -516,29 +829,30 @@ async fn build_sections(pool: &Pool, cfg: &Config) -> Vec<SectionView> {
             (
                 c.name.clone(),
                 vec![one("Latency", "check", "latency_ms", &c.id)],
+                latency_line(c),
             )
         })
         .collect();
 
     let mut n = 0;
-    let mut section =
-        |title: &str, empty: &str, cards: Vec<(String, Vec<CardSeries>)>| SectionView {
-            title: title.to_string(),
-            empty_note: empty.to_string(),
-            cards: cards
-                .into_iter()
-                .map(|(title, series)| {
-                    n += 1;
-                    CardView {
-                        id: format!("chart-{n}"),
-                        title,
-                        series,
-                    }
-                })
-                .collect(),
-        };
+    let mut section = |title: &str, empty: &str, cards: Vec<Card>| SectionView {
+        title: title.to_string(),
+        empty_note: empty.to_string(),
+        cards: cards
+            .into_iter()
+            .map(|(title, series, threshold)| {
+                n += 1;
+                CardView {
+                    id: format!("chart-{n}"),
+                    title,
+                    series,
+                    threshold,
+                }
+            })
+            .collect(),
+    };
     vec![
-        section("Host", "", host_cards),
+        section("The server", "", host_cards),
         section(
             "Containers",
             "No container metrics yet. Enable [docker] in the config to collect them.",
@@ -651,8 +965,42 @@ async fn incidents_page(State(state): State<AppState>, jar: CookieJar) -> Respon
     }
     render(&IncidentsTemplate {
         site: SiteView::new(&cfg, logged_in, "incidents"),
+        side: SideView {
+            say: incidents_say(&incidents, now),
+            facts: Some(facts(&state.pool, &cfg).await),
+        },
         months,
     })
+}
+
+/// Left column of the incident list: how much went wrong in 90 days.
+fn incidents_say(incidents: &[crate::models::Incident], now: i64) -> Say {
+    let recent = incidents
+        .iter()
+        .filter(|i| i.created_at >= now - 90 * 86_400)
+        .count();
+    let open = incidents.iter().filter(|i| i.resolved_at.is_none()).count();
+    let headline = match (recent, incidents.is_empty()) {
+        (_, true) => "Nothing has gone wrong yet.".to_string(),
+        (0, false) => "Nothing has gone wrong in 90 days.".to_string(),
+        (1, _) => "One thing went wrong in the last 90 days.".to_string(),
+        (n, _) => {
+            let word = crate::sentence::number_word(n);
+            let mut chars = word.chars();
+            let cap = chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default();
+            format!("{cap} things went wrong in the last 90 days.")
+        }
+    };
+    let detail = match open {
+        0 if incidents.is_empty() => String::new(),
+        0 => "All of them are resolved.".to_string(),
+        1 => "One is still open.".to_string(),
+        n => format!("{} are still open.", crate::sentence::number_word(n)),
+    };
+    SideView::plain(&headline, &detail).say
 }
 
 async fn incident_page(
@@ -672,7 +1020,10 @@ async fn incident_page(
                 &cfg,
                 StatusCode::NOT_FOUND,
                 "Incident not found",
-                "This incident does not exist or has been removed.",
+                SideView::plain(
+                    &format!("There is no incident {id}."),
+                    "It may have been removed, or the link is wrong.",
+                ),
             )
         }
         Err(e) => return internal(&state, e),
@@ -682,15 +1033,21 @@ async fn incident_page(
         .unwrap_or_default();
     // Newest first, as status pages show it.
     let updates: Vec<UpdateView> = updates.iter().rev().map(UpdateView::from).collect();
+    let now = crate::now_ts();
+    let detail = match inc.resolved_at {
+        Some(r) => format!(
+            "Resolved after {}.",
+            crate::sentence::humanize(r - inc.created_at)
+        ),
+        None => format!(
+            "Still open, {} so far.",
+            crate::sentence::humanize(now - inc.created_at)
+        ),
+    };
     render(&IncidentTemplate {
         site: SiteView::new(&cfg, logged_in, "incidents"),
-        incident: IncidentView::new(
-            &inc,
-            component_name(&cfg, &inc.component),
-            None,
-            crate::now_ts(),
-        ),
-        impact_icon: state_icon(inc.impact),
+        side: SideView::plain(&inc.title, &detail),
+        incident: IncidentView::new(&inc, component_name(&cfg, &inc.component), None, now),
         updates,
     })
 }
@@ -708,6 +1065,10 @@ async fn manage_page(State(state): State<AppState>, jar: CookieJar) -> Response 
     let active = db::active_incidents(&state.pool).await.unwrap_or_default();
     render(&ManageTemplate {
         site: SiteView::new(&cfg, true, "manage"),
+        side: SideView::plain(
+            "Change what people see.",
+            "Open and update incidents, or start maintenance to mute alerts. Checks live in the config file.",
+        ),
         components: cfg
             .components
             .iter()
@@ -799,8 +1160,7 @@ async fn asset(State(state): State<AppState>, Path(file): Path<String>) -> Respo
     let fresh = HeaderValue::from_static("no-cache");
     match file.as_str() {
         "favicon.svg" => {
-            let cfg = state.cfg();
-            let svg = crate::theme::favicon_svg(&cfg.theme.accent);
+            let svg = crate::theme::favicon_svg();
             return (
                 [
                     (CONTENT_TYPE, HeaderValue::from_static("image/svg+xml")),
@@ -891,6 +1251,51 @@ async fn asset(State(state): State<AppState>, Path(file): Path<String>) -> Respo
         .into_response()
 }
 
+/// Self-hosted fonts, so the page makes no third-party requests. Only the
+/// names below are served; anything else is a 404.
+async fn font(Path(file): Path<String>) -> Response {
+    macro_rules! fonts {
+        ($($name:literal),* $(,)?) => {
+            match file.as_str() {
+                $($name => include_bytes!(concat!("../assets/fonts/", $name)).as_slice(),)*
+                _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+            }
+        };
+    }
+    let body: &[u8] = fonts!(
+        "bricolage-grotesque-latin-400-normal.woff2",
+        "bricolage-grotesque-latin-600-normal.woff2",
+        "bricolage-grotesque-latin-800-normal.woff2",
+        "bricolage-grotesque-latin-ext-400-normal.woff2",
+        "bricolage-grotesque-latin-ext-600-normal.woff2",
+        "bricolage-grotesque-latin-ext-800-normal.woff2",
+        "martian-mono-latin-400-normal.woff2",
+        "martian-mono-latin-ext-400-normal.woff2",
+        "bricolage-grotesque-OFL.txt",
+        "martian-mono-OFL.txt",
+    );
+    let content_type = if file.ends_with(".txt") {
+        "text/plain; charset=utf-8"
+    } else {
+        "font/woff2"
+    };
+    (
+        [
+            (CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            // File names carry no version, but the files never change for a
+            // given build; a day keeps upgrades visible without refetching
+            // on every page.
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+            NOSNIFF,
+        ],
+        body,
+    )
+        .into_response()
+}
+
 // -- heartbeat -------------------------------------------------------------
 
 async fn heartbeat(State(state): State<AppState>, Path(token): Path<String>) -> Response {
@@ -918,8 +1323,13 @@ async fn login_page(State(state): State<AppState>, jar: CookieJar) -> Response {
     let logged_in = is_logged_in(&state, &jar).await;
     render(&LoginTemplate {
         site: SiteView::new(&state.cfg(), logged_in, "login"),
+        side: login_side(),
         error: None,
     })
+}
+
+fn login_side() -> SideView {
+    SideView::plain("Sign in to change things.", "Reading needs no password.")
 }
 
 #[derive(Deserialize)]
@@ -942,6 +1352,7 @@ async fn login_submit(
             StatusCode::TOO_MANY_REQUESTS,
             render(&LoginTemplate {
                 site: SiteView::new(&cfg, false, "login"),
+                side: login_side(),
                 error: Some("Too many login attempts. Try again in 15 minutes.".to_string()),
             }),
         )
@@ -957,6 +1368,7 @@ async fn login_submit(
             StatusCode::UNAUTHORIZED,
             render(&LoginTemplate {
                 site: SiteView::new(&cfg, false, "login"),
+                side: login_side(),
                 error: Some("Incorrect password.".to_string()),
             }),
         )

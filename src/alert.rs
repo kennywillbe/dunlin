@@ -175,10 +175,9 @@ impl AlertEngine {
                             id,
                             now,
                             IncidentState::Investigating,
-                            &format!(
-                                "Automatically opened. {}",
-                                message.unwrap_or("check failed")
-                            ),
+                            // This text leads the status page's detail paragraph, so it
+                            // reads as a sentence rather than a raw probe error.
+                            &sentence_case(message.unwrap_or("check failed")),
                             true,
                         )
                         .await?;
@@ -444,5 +443,33 @@ mod tests {
         let inc = db::incident(&pool, id).await.unwrap().unwrap();
         assert!(inc.resolved_at.is_some());
         assert_eq!(rec.count(), 1);
+    }
+}
+
+fn sentence_case(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let mut out: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => return String::new(),
+    };
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
+}
+
+#[cfg(test)]
+mod sentence_case_tests {
+    use super::sentence_case;
+
+    #[test]
+    fn probe_errors_read_as_sentences() {
+        assert_eq!(
+            sentence_case("connect failed: Connection refused (os error 61)"),
+            "Connect failed: Connection refused (os error 61)."
+        );
+        assert_eq!(sentence_case("already fine."), "Already fine.");
+        assert_eq!(sentence_case("  "), "");
     }
 }

@@ -80,26 +80,6 @@ pub struct WebConfig {
     pub password_hash: Option<String>,
 }
 
-/// `[theme]` light / dark / follow the browser.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThemeMode {
-    #[default]
-    Auto,
-    Light,
-    Dark,
-}
-
-impl ThemeMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ThemeMode::Auto => "auto",
-            ThemeMode::Light => "light",
-            ThemeMode::Dark => "dark",
-        }
-    }
-}
-
 /// `[theme]`
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,8 +88,6 @@ pub struct ThemeConfig {
     pub title: String,
     #[serde(default = "default_accent")]
     pub accent: String,
-    #[serde(default)]
-    pub mode: ThemeMode,
     /// Relative paths are resolved against the config file's directory.
     #[serde(default)]
     pub logo: Option<PathBuf>,
@@ -122,7 +100,6 @@ impl Default for ThemeConfig {
         Self {
             title: default_title(),
             accent: default_accent(),
-            mode: ThemeMode::Auto,
             logo: None,
             custom_css: None,
         }
@@ -850,8 +827,7 @@ check = "nope"
     fn theme_defaults_and_validation() {
         let cfg = parse_str(&base_with_real_hash()).unwrap();
         assert_eq!(cfg.theme.title, "Status");
-        assert_eq!(cfg.theme.accent, "#0f6f73");
-        assert_eq!(cfg.theme.mode, ThemeMode::Auto);
+        assert_eq!(cfg.theme.accent, "#17150f");
         assert!(cfg.theme_files.logo.is_none());
 
         for bad in ["teal", "#0f6f7", "#0f6f73;}", "#fff"] {
@@ -859,7 +835,8 @@ check = "nope"
             let err = parse_str(&s).unwrap_err().to_string();
             assert!(err.contains("theme.accent"), "{bad}: {err}");
         }
-        let s = format!("{}\n[theme]\nmode = \"sepia\"\n", base_with_real_hash());
+        // Light only: the old dark-mode switch is an unknown key now.
+        let s = format!("{}\n[theme]\nmode = \"dark\"\n", base_with_real_hash());
         assert!(parse_str(&s).is_err());
         let s = format!("{}\n[theme]\ntitle = \"  \"\n", base_with_real_hash());
         assert!(parse_str(&s).is_err());
@@ -871,11 +848,10 @@ check = "nope"
         std::fs::write(dir.path().join("brand.svg"), "<svg/>").unwrap();
         std::fs::write(dir.path().join("extra.css"), "body{}").unwrap();
         let s = format!(
-            "{}\n[theme]\nlogo = \"brand.svg\"\ncustom_css = \"extra.css\"\nmode = \"dark\"\n",
+            "{}\n[theme]\nlogo = \"brand.svg\"\ncustom_css = \"extra.css\"\n",
             base_with_real_hash()
         );
         let cfg = parse_str_at(&s, dir.path()).unwrap();
-        assert_eq!(cfg.theme.mode, ThemeMode::Dark);
         let logo = cfg.theme_files.logo.as_ref().unwrap();
         assert_eq!(logo.content_type, "image/svg+xml");
         assert_eq!(&*logo.bytes, b"<svg/>");

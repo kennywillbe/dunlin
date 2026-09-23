@@ -1,6 +1,6 @@
-// Metrics page: one uPlot chart per card. Colours come from the CSS custom
-// properties at draw time, so the accent, light/dark mode and any custom CSS
-// all apply to the charts without a second source of truth.
+// Metrics page: one uPlot chart per card. Colours and fonts come from the CSS
+// custom properties at draw time, so a custom stylesheet restyles the charts
+// without a second source of truth.
 (function () {
   "use strict";
 
@@ -55,6 +55,15 @@
     return d.toLocaleString(undefined, opts);
   }
 
+  // One short line per tick; uPlot's default two-line dates collide at
+  // card width.
+  function fmtAxisTime(ts) {
+    var d = new Date(ts * 1000);
+    return range === "24h"
+      ? d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
   function part(card, role) {
     return document.querySelector("#" + card.id + " [data-role=" + role + "]");
   }
@@ -101,8 +110,29 @@
     card.defaultValue = value.textContent;
   }
 
+  // Lines are ink; extra series step down to softer greys instead of hues,
+  // because colour on this page is kept for problems.
   function colors() {
-    return [css("--accent", "#0f6f73"), css("--chart-2", "#b86b1a"), css("--chart-3", "#6b5fb8")];
+    return [css("--ink", "#17150f"), css("--soft", "#5e5a50"), css("--calm", "#a8a293")];
+  }
+
+  // The trouble line of a card, dashed in the problem colour.
+  function thresholdHook(card) {
+    return function (u) {
+      if (card.threshold == null) return;
+      var y = u.valToPos(card.threshold, "y", true);
+      if (!isFinite(y) || y < u.bbox.top || y > u.bbox.top + u.bbox.height) return;
+      var ctx = u.ctx;
+      ctx.save();
+      ctx.strokeStyle = css("--bad", "#e2461f");
+      ctx.lineWidth = 1.5 * devicePixelRatio;
+      ctx.setLineDash([5 * devicePixelRatio, 4 * devicePixelRatio]);
+      ctx.beginPath();
+      ctx.moveTo(u.bbox.left, Math.round(y));
+      ctx.lineTo(u.bbox.left + u.bbox.width, Math.round(y));
+      ctx.stroke();
+      ctx.restore();
+    };
   }
 
   function build(card, results) {
@@ -118,10 +148,10 @@
     empty.hidden = true;
 
     var palette = colors();
-    var grid = css("--grid", "#e1e5eb");
-    var muted = css("--text-muted", "#5b6676");
-    var mono = css("--font-mono", "ui-monospace, monospace");
-    var axisFont = "11px " + mono;
+    var grid = css("--hair", "#dcd9d0");
+    var muted = css("--soft", "#5e5a50");
+    var mono = css("--mono", "ui-monospace, monospace");
+    var axisFont = "10.5px " + mono;
     var hasRight = card.series.some(function (s) { return s.right; });
     var leftUnit = results[0].unit;
     var rightIdx = card.series.findIndex(function (s) { return s.right; });
@@ -135,7 +165,7 @@
         scale: s.right ? "r" : "y",
         stroke: c,
         width: 1.5,
-        fill: card.series.length === 1 ? alpha(c, 0.12) : undefined,
+        fill: card.series.length === 1 ? alpha(grid, 0.55) : undefined,
         points: { show: false },
         spanGaps: false,
         value: function (u, v) { return fmt(v, results[i].unit); }
@@ -148,34 +178,39 @@
         side: side,
         stroke: muted,
         font: axisFont,
-        size: 56,
+        size: unit === "bytes/s" || unit === "bytes" ? 76 : 58,
         grid: { show: side === 3, stroke: grid, width: 1 },
         ticks: { show: false },
         values: function (u, vals) { return vals.map(function (v) { return fmt(v, unit); }); }
       };
     };
     var axes = [
-      { stroke: muted, font: axisFont, grid: { show: false }, ticks: { stroke: grid, width: 1, size: 4 } },
+      {
+        stroke: muted, font: axisFont, space: 70, grid: { show: false },
+        ticks: { stroke: grid, width: 1, size: 4 },
+        values: function (u, vals) { return vals.map(fmtAxisTime); }
+      },
       axis("y", leftUnit, 3)
     ];
     if (hasRight) axes.push(axis("r", rightUnit, 1));
 
-    var scales = { x: { time: true }, y: { range: yRange(leftUnit) } };
+    var scales = { x: { time: true }, y: { range: yRange(leftUnit, card.threshold) } };
     if (hasRight) scales.r = { range: yRange(rightUnit) };
 
     var opts = {
       width: Math.max(body.clientWidth, 200),
-      height: 170,
+      height: 160,
       series: series,
       axes: axes,
       scales: scales,
       legend: { show: false },
       cursor: {
         y: false,
-        points: { size: 6, fill: css("--surface", "#fff") },
+        points: { size: 6, fill: css("--bg", "#f1f0ec") },
         drag: { x: false, y: false }
       },
       hooks: {
+        draw: [thresholdHook(card)],
         setCursor: [function (u) {
           var idx = u.cursor.idx;
           var value = part(card, "value");
@@ -192,10 +227,14 @@
     card.results = results;
   }
 
-  // Percentages keep a fixed 0-100 axis so cards are comparable at a glance.
-  function yRange(unit) {
+  // Percentages keep a fixed 0-100 axis so cards are comparable at a glance;
+  // other units leave room for the trouble line so it is always visible.
+  function yRange(unit, line) {
     if (unit === "%") return [0, 100];
-    return function (u, min, max) { return [0, max > 0 ? max * 1.1 : 1]; };
+    return function (u, min, max) {
+      var top = Math.max(max, line || 0);
+      return [0, top > 0 ? top * 1.1 : 1];
+    };
   }
 
   function load(card) {
@@ -211,12 +250,8 @@
 
   function loadAll() { CARDS.forEach(load); }
 
-  function redrawAll() {
-    CARDS.forEach(function (card) { if (card.results) build(card, card.results); });
-  }
-
   // Range control: links work without script; with it, swap data in place.
-  var seg = document.querySelector(".segmented");
+  var seg = document.querySelector(".range");
   if (seg) {
     seg.addEventListener("click", function (e) {
       var a = e.target.closest("a[data-range]");
@@ -235,18 +270,17 @@
       entries.forEach(function (entry) {
         var card = entry.target.closest(".chart-card");
         var u = card && charts[card.id];
-        if (u) u.setSize({ width: Math.max(entry.contentRect.width, 200), height: 170 });
+        if (u) u.setSize({ width: Math.max(entry.contentRect.width, 200), height: 160 });
       });
     });
     document.querySelectorAll(".chart-body").forEach(function (b) { ro.observe(b); });
   }
 
-  // Theme switches (OS dark mode) change the custom properties; redraw so
-  // the canvas picks them up.
-  if (window.matchMedia) {
-    var mq = window.matchMedia("(prefers-color-scheme: dark)");
-    if (mq.addEventListener) mq.addEventListener("change", redrawAll);
+  // Canvas text does not wait for web fonts; draw once they are in so the
+  // axis labels are not stuck in the fallback face.
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(loadAll, loadAll);
+  } else {
+    loadAll();
   }
-
-  loadAll();
 })();

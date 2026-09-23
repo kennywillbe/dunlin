@@ -1,13 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Manage · {% endblock %}
 {% block content %}
-<div class="page-head">
-  <h1 class="page-title">Manage</h1>
-</div>
-
 <div class="manage-grid">
-  <section class="panel form-panel" aria-labelledby="new-incident">
-    <h2 id="new-incident" class="panel-title">Report an incident</h2>
+  <section class="form-section" aria-labelledby="new-incident">
+    <h2 id="new-incident" class="form-title">Report an incident</h2>
     <form method="post" action="/incidents" class="form">
       <div class="field">
         <label for="i-title">Title</label>
@@ -33,15 +29,15 @@
       </div>
       <div class="field">
         <label for="i-message">First update</label>
-        <textarea id="i-message" name="message" rows="3" placeholder="We are investigating reports of..."></textarea>
+        <textarea id="i-message" name="message" rows="3" placeholder="We are looking into reports of..."></textarea>
       </div>
       <div class="actions"><button class="button primary" type="submit">Create incident</button></div>
     </form>
   </section>
 
-  <section class="panel form-panel" aria-labelledby="new-maintenance">
-    <h2 id="new-maintenance" class="panel-title">Start maintenance</h2>
-    <p class="muted">Alerts for the component are muted while the window is open.</p>
+  <section class="form-section" aria-labelledby="new-maintenance">
+    <h2 id="new-maintenance" class="form-title">Start maintenance</h2>
+    <p class="soft">Alerts for the component are muted while the window is open.</p>
     <form method="post" action="/maintenance" class="form">
       <div class="field">
         <label for="m-component">Component</label>
@@ -51,7 +47,7 @@
         </select>
       </div>
       <div class="field">
-        <label for="m-duration">Duration (minutes)</label>
+        <label for="m-duration">Duration in minutes</label>
         <input id="m-duration" type="number" name="duration_minutes" value="60" min="1" inputmode="numeric">
       </div>
       <div class="field">
@@ -63,41 +59,39 @@
   </section>
 </div>
 
-<section class="manage-list" aria-labelledby="windows">
-  <h2 id="windows" class="section-title">Maintenance windows</h2>
+<section class="log" aria-labelledby="windows">
+  <h2 id="windows" class="log-title">Maintenance windows</h2>
   {% if maintenance.is_empty() %}
-  <p class="muted">No active or scheduled maintenance.</p>
+  <div class="entry"><span class="d"></span><p class="q">None open or planned.</p></div>
   {% else %}
-  <ul class="plain-list panel">
-    {% for m in maintenance %}
-    <li class="list-row">
-      <div>
-        <p class="row-title">{{ m.component }}{% if !m.note.is_empty() %} <span class="muted">· {{ m.note }}</span>{% endif %}</p>
-        <p class="row-meta num">{% if m.active %}Active until{% else %}Starts <time datetime="{{ m.starts.iso }}" data-local="datetime">{{ m.starts.text }}</time>, ends{% endif %} <time datetime="{{ m.ends.iso }}" data-local="datetime">{{ m.ends.text }}</time></p>
-      </div>
-      <form method="post" action="/maintenance/{{ m.id }}/end" class="inline"><button class="button small" type="submit">End now</button></form>
-    </li>
-    {% endfor %}
-  </ul>
+  {% for m in maintenance %}
+  <div class="entry row-with-action">
+    <span class="d">{% if m.active %}now{% else %}planned{% endif %}</span>
+    <div class="items">
+      <p class="item"><span class="sw s-maintenance" aria-hidden="true"></span><span class="t">{{ m.component }}</span>{% if !m.note.is_empty() %} <span class="m">— {{ m.note }}</span>{% endif %}</p>
+      <p class="m sub">{% if m.active %}Until{% else %}From <time datetime="{{ m.starts.iso }}" data-local="datetime">{{ m.starts.text }}</time> to{% endif %} <time datetime="{{ m.ends.iso }}" data-local="datetime">{{ m.ends.text }}</time></p>
+    </div>
+    <form method="post" action="/maintenance/{{ m.id }}/end" class="inline"><button class="button small" type="submit">End now</button></form>
+  </div>
+  {% endfor %}
   {% endif %}
 </section>
 
-<section class="manage-list" aria-labelledby="open-incidents">
-  <h2 id="open-incidents" class="section-title">Open incidents</h2>
+<section class="log" aria-labelledby="open-incidents">
+  <h2 id="open-incidents" class="log-title">Open incidents</h2>
   {% if active_incidents.is_empty() %}
-  <p class="muted">No open incidents.</p>
+  <div class="entry"><span class="d"></span><p class="q">None.</p></div>
   {% else %}
-  <ul class="plain-list panel">
-    {% for inc in active_incidents %}
-    <li class="list-row">
-      <div>
-        <p class="row-title"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></p>
-        <p class="row-meta"><span class="t-{{ inc.impact_class }}">{{ inc.impact_label }}</span> · {{ inc.component }} · {{ inc.state_label }} · <time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time></p>
-      </div>
-      <a class="button small" href="/incidents/{{ inc.id }}">Update</a>
-    </li>
-    {% endfor %}
-  </ul>
+  {% for inc in active_incidents %}
+  <div class="entry row-with-action">
+    <time class="d" datetime="{{ inc.created.iso }}">{{ inc.day }}</time>
+    <div class="items">
+      <p class="item"><span class="sw s-{{ inc.impact_class }}" aria-hidden="true"></span><a class="t" href="/incidents/{{ inc.id }}">{{ inc.title }}</a> <span class="m">— {{ inc.state_label }} · {{ inc.duration }}</span></p>
+      <p class="m sub">{{ inc.component }} · {{ inc.impact_label }}</p>
+    </div>
+    <a class="button small" href="/incidents/{{ inc.id }}">Update</a>
+  </div>
+  {% endfor %}
   {% endif %}
 </section>
 {% endblock %}

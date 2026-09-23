@@ -16,8 +16,8 @@ Licensed under MIT OR Apache-2.0.
 - **Status page**: component groups, five states (operational, degraded,
   partial outage, major outage, maintenance), overall banner, 90-day uptime
   bars, active incidents and maintenance, 14 days of past incidents, Atom
-  feed. Light and dark themes, title, accent, logo and extra CSS from the
-  config.
+  feed. A plain sentence at the top says what is wrong right now. Title,
+  accent, logo and extra CSS from the config.
 - **Alerts**: per-check failure / recovery / reminder thresholds, incidents
   opened and resolved automatically, optional maintenance windows that mute
   notifications, Telegram and webhook notifiers, a daily summary.
@@ -81,8 +81,7 @@ The `[theme]` table changes how the pages look, without touching templates:
 ```toml
 [theme]
 title = "Acme status"      # header, tab title and feed title
-accent = "#0f6f73"         # #rrggbb only
-mode = "auto"              # auto | light | dark
+accent = "#17150f"         # #rrggbb only; links, nav underline, buttons
 logo = "logo.svg"          # png, svg, jpg or webp, max 256 KB
 custom_css = "custom.css"  # loaded after the built-in stylesheet, max 256 KB
 ```
@@ -90,8 +89,11 @@ custom_css = "custom.css"  # loaded after the built-in stylesheet, max 256 KB
 Paths are relative to the config file. Both files are read when the config
 loads and again on every reload, so a broken or oversized file is reported
 like any other config error. The built-in colours are CSS custom properties on
-`:root` (`--bg`, `--surface`, `--text`, `--ok`, `--degraded`, `--major` and so
-on), which is usually all a custom stylesheet needs to override.
+`:root` (`--bg`, `--ink`, `--soft`, `--hair`, `--warn`, `--bad`, `--down`,
+`--mnt` and so on), which is usually all a custom stylesheet needs to override.
+The pages are light only. The fonts (Bricolage Grotesque and Martian Mono,
+SIL Open Font License) are built into the binary, so the pages make no
+third-party requests.
 
 The config file is watched. When it changes, dunlin reloads it; if the new file
 is invalid nothing changes and the error is logged.

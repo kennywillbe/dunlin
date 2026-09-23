@@ -1,86 +1,42 @@
 {% extends "base.html" %}
 {% block head %}<script src="/assets/htmx.min.js" defer></script>{% endblock %}
+{% block live %} id="live" hx-get="/" hx-trigger="every 60s" hx-select="#live" hx-swap="outerHTML"{% endblock %}
 {% block content %}
-<div id="live" hx-get="/" hx-trigger="every 60s" hx-select="#live" hx-swap="outerHTML">
-
-<section class="banner s-{{ overall_class }}" aria-live="polite">
-  <span class="banner-icon">{{ overall_icon|safe }}</span>
-  <h1 class="banner-label">{{ overall_label }}</h1>
-  <p class="banner-updated">Updated <time datetime="{{ updated.iso }}" data-local="time" data-zone>{{ updated.text }}</time></p>
-</section>
-
-{% for inc in active_incidents %}
-<article class="notice s-{{ inc.impact_class }}">
-  <div class="notice-head">
-    <h2 class="notice-title"><a href="/incidents/{{ inc.id }}">{{ inc.title }}</a></h2>
-    <span class="pill">{{ inc.state_label }}</span>
-  </div>
-  {% if let Some(m) = inc.last_message %}<p class="notice-body">{{ m }}</p>{% endif %}
-  <p class="notice-meta">{{ inc.component }} · {{ inc.impact_label }} · since <time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time></p>
-</article>
-{% endfor %}
-
-{% for m in maintenance %}
-<article class="notice s-maintenance">
-  <div class="notice-head">
-    <h2 class="notice-title"><span class="notice-icon">{{ wrench_icon|safe }}</span>{% if m.active %}Maintenance in progress{% else %}Scheduled maintenance{% endif %}</h2>
-    <span class="pill">{{ m.component }}</span>
-  </div>
-  {% if !m.note.is_empty() %}<p class="notice-body">{{ m.note }}</p>{% endif %}
-  <p class="notice-meta"><time datetime="{{ m.starts.iso }}" data-local="datetime">{{ m.starts.text }}</time> to <time datetime="{{ m.ends.iso }}" data-local="datetime">{{ m.ends.text }}</time></p>
-</article>
-{% endfor %}
+<p class="cap" aria-hidden="true"><span><span class="wide">90 days ago</span><span class="narrow">30 days ago</span></span><span class="cap-mid">height = how much went wrong that day</span><span>today</span></p>
 
 {% if groups.is_empty() %}
-<div class="panel empty-panel">
-  <p>No components are configured yet. Add <code>[[components]]</code> to the config file.</p>
-</div>
+<p class="quiet">No components are configured yet. Add <code>[[components]]</code> to the config file.</p>
 {% endif %}
 {% for group in groups %}
-<section class="panel group" aria-label="{{ group.name }}">
-  <h2 class="group-name">{{ group.name }}</h2>
+<section class="grp" aria-labelledby="grp-{{ loop.index }}">
+  <h2 class="grp-name" id="grp-{{ loop.index }}">{{ group.name }}</h2>
   {% for c in group.components %}
-  <div class="component">
-    <div class="component-head">
-      <h3 class="component-name">{{ c.name }}{% if let Some(d) = c.description %}
-        <button type="button" class="help" data-tip="{{ d }}" aria-label="About {{ c.name }}: {{ d }}">{{ info_icon|safe }}</button>{% endif %}</h3>
-      <span class="state-label s-{{ c.state_class }}">{{ c.state_label }}</span>
+  <div class="svc s-{{ c.state_class }}">
+    <div class="who">
+      <h3 class="n">{{ c.name }}{% if let Some(d) = c.description %}<button type="button" class="help" data-tip="{{ d }}" aria-label="About {{ c.name }}: {{ d }}">{{ info_icon|safe }}</button>{% endif %}</h3>
+      <p class="s {{ c.sub_class }}"><span class="sr">{{ c.state_label }}. </span>{{ c.sub }}</p>
     </div>
-    <div class="bars" role="group" aria-label="{{ c.name }}, uptime for the last 90 days. Use the arrow keys to move between days.">
-      {% for bar in c.bars %}<span class="bar s-{{ bar.class }}" role="img" tabindex="{% if loop.last %}0{% else %}-1{% endif %}" aria-label="{{ bar.aria }}" data-date="{{ bar.date }}" data-uptime="{{ bar.uptime }}" data-label="{{ bar.label }}"></span>{% endfor %}
+    <div class="line" role="group" aria-label="{{ c.name }}, one mark per day for the last 90 days. Use the arrow keys to move between days.">
+      {%- for bar in c.bars -%}<span class="bar s-{{ bar.class }}{% if loop.last %} today{% endif %}" role="img" tabindex="{% if loop.last %}0{% else %}-1{% endif %}" aria-label="{{ bar.aria }}" data-date="{{ bar.date }}" data-uptime="{{ bar.uptime }}" data-label="{{ bar.label }}"></span>{%- endfor -%}
     </div>
-    <div class="bars-legend">
-      <span><span class="wide">90 days ago</span><span class="narrow">30 days ago</span></span>
-      <span class="legend-rule" aria-hidden="true"></span>
-      <span class="num">{% if let Some(u) = c.uptime_90 %}{{ u }}% uptime{% else %}No uptime data{% endif %}</span>
-      <span class="legend-rule" aria-hidden="true"></span>
-      <span>Today</span>
-    </div>
+    <p class="pct">{% if let Some(u) = c.uptime_90 %}{{ u }}%{% else %}<span class="soft">no data</span>{% endif %}</p>
   </div>
   {% endfor %}
 </section>
 {% endfor %}
 
-<section class="past" aria-labelledby="past-heading">
-  <h2 id="past-heading" class="section-title">Past incidents</h2>
+<section class="log" aria-labelledby="past-heading">
+  <h2 id="past-heading" class="log-title">What happened lately</h2>
   {% for day in past_days %}
-  <div class="day">
-    <h3 class="day-heading">{{ day.heading }}</h3>
-    {% if day.incidents.is_empty() %}
-    <p class="muted">No incidents reported.</p>
-    {% else %}
-    {% for inc in day.incidents %}
-    <div class="past-incident">
-      <a class="past-title t-{{ inc.impact_class }}" href="/incidents/{{ inc.id }}">{{ inc.title }}</a>
-      {% if let Some(m) = inc.last_message %}<p class="past-update"><strong>{{ inc.state_label }}</strong> · {{ m }}</p>{% endif %}
-      <p class="past-meta"><time datetime="{{ inc.created.iso }}" data-local="datetime">{{ inc.created.text }}</time>{% if inc.resolved.is_some() %} · resolved after {{ inc.duration }}{% endif %}</p>
+  <div class="entry">
+    <time class="d" datetime="{{ day.iso }}">{{ day.heading }}</time>
+    <div class="items">
+      {% if day.items.is_empty() %}<p class="q">Nothing.</p>{% else %}
+      {% for i in day.items %}<p class="item"><span class="sw s-{{ i.swatch }}" aria-hidden="true"></span>{% if let Some(h) = i.href %}<a class="t" href="{{ h }}">{{ i.title }}</a>{% else %}<span class="t">{{ i.title }}</span>{% endif %} <span class="m">— {{ i.note }}</span></p>{% endfor %}
+      {% endif %}
     </div>
-    {% endfor %}
-    {% endif %}
   </div>
   {% endfor %}
-  <p class="more"><a href="/incidents">Incident history</a></p>
+  <p class="more"><a href="/incidents">Every incident</a></p>
 </section>
-
-</div>
 {% endblock %}
