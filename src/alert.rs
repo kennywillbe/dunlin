@@ -1,7 +1,7 @@
 //! Per-check alert state machine and the engine that turns transitions into
 //! incidents and notifications.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -135,6 +135,10 @@ impl AlertEngine {
     /// files its incidents under its own id, and skipping it left such an
     /// incident open forever once the check recovered after a restart.
     pub async fn bootstrap(&mut self, pool: &Pool, cfg: &Config) -> Result<()> {
+        // Incidents left open by a run whose config had more components than
+        // this one would otherwise never resolve, since no check feeds them.
+        self.forget_unmonitored(pool, cfg, None, crate::now_ts())
+            .await?;
         for check in &cfg.checks {
             let component = cfg.incident_component(&check.id);
             if let Some(incident) = db::active_incident_for(pool, &component).await? {
@@ -143,6 +147,68 @@ impl AlertEngine {
             }
         }
         Ok(())
+    }
+
+    /// Resolve automatic incidents on components that no check in `cfg`
+    /// reports to any more, and drop machines of checks that are gone.
+    ///
+    /// `previous` is only used to put the component's display name in the
+    /// timeline, since the new config no longer knows it. Returns the ids of
+    /// the incidents it resolved.
+    pub async fn forget_unmonitored(
+        &mut self,
+        pool: &Pool,
+        cfg: &Config,
+        previous: Option<&Config>,
+        now: i64,
+    ) -> Result<Vec<i64>> {
+        let monitored: HashSet<String> = cfg
+            .checks
+            .iter()
+            .map(|c| cfg.incident_component(&c.id))
+            .chain(
+                cfg.components
+                    .iter()
+                    .filter(|c| c.check.as_deref().is_some_and(|id| !id.is_empty()))
+                    .map(|c| c.id.clone()),
+            )
+            .collect();
+        let mut resolved = Vec::new();
+        for incident in db::active_incidents(pool).await? {
+            // Manual incidents were opened by an operator and are theirs to
+            // close; the status page shows them under the raw component id.
+            if !incident.auto || monitored.contains(&incident.component) {
+                continue;
+            }
+            let name = previous
+                .and_then(|p| p.component(&incident.component))
+                .map_or(incident.component.as_str(), |c| c.name.as_str());
+            db::resolve_incident(pool, incident.id, now).await?;
+            db::add_update(
+                pool,
+                incident.id,
+                now,
+                IncidentState::Resolved,
+                &format!("Resolved: {name} is no longer monitored."),
+                true,
+            )
+            .await?;
+            // No notification: removing the check from the config was a
+            // deliberate act, so a "recovered" alert would be false and noise.
+            tracing::info!(
+                incident = incident.id,
+                component = %incident.component,
+                "resolved incident for a component that is no longer monitored"
+            );
+            resolved.push(incident.id);
+        }
+        // A machine still pointing at one of these incidents would resolve it a
+        // second time (and send "recovered") once its check passes again, e.g.
+        // when the check stays but moved to another component.
+        self.machines.retain(|check_id, m| {
+            cfg.check(check_id).is_some() && m.incident_id.is_none_or(|id| !resolved.contains(&id))
+        });
+        Ok(resolved)
     }
 
     /// Feed one probe outcome. `muted` suppresses notifications (maintenance)
@@ -576,6 +642,154 @@ mod tests {
         }
         let inc = db::incident(&pool, id).await.unwrap().unwrap();
         assert!(inc.resolved_at.is_some());
+    }
+
+    fn web_config() -> Config {
+        Config {
+            checks: vec![check()],
+            components: vec![crate::config::ComponentConfig {
+                id: "web".into(),
+                name: "Web site".into(),
+                group: None,
+                check: Some("c1".into()),
+                description: None,
+            }],
+            ..Config::default()
+        }
+    }
+
+    async fn manual_incident(pool: &Pool, component: &str) -> i64 {
+        db::create_incident(
+            pool,
+            component,
+            "Planned work went wrong",
+            State::PartialOutage,
+            IncidentState::Identified,
+            false,
+            0,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn removing_a_component_resolves_its_incident_quietly() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        let before = web_config();
+        let c = check();
+        for t in 0..3 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let id = db::active_incident_for(&pool, "web")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let manual = manual_incident(&pool, "web").await;
+        assert_eq!(rec.count(), 1);
+        assert!(engine.machines().contains_key("c1"));
+
+        let after = Config::default();
+        let resolved = engine
+            .forget_unmonitored(&pool, &after, Some(&before), 50)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, vec![id]);
+        let inc = db::incident(&pool, id).await.unwrap().unwrap();
+        assert_eq!(inc.resolved_at, Some(50));
+        assert_eq!(inc.state, IncidentState::Resolved);
+        let last = db::incident_updates(&pool, id).await.unwrap();
+        let last = last.iter().max_by_key(|u| u.id).unwrap();
+        assert_eq!(last.message, "Resolved: Web site is no longer monitored.");
+        assert_eq!(last.state, IncidentState::Resolved);
+        assert_eq!(rec.count(), 1, "removal must not notify");
+        assert!(engine.machines().is_empty());
+
+        // The operator's own incident on the same component stays open.
+        let manual = db::incident(&pool, manual).await.unwrap().unwrap();
+        assert!(manual.resolved_at.is_none());
+        assert_eq!(manual.state, IncidentState::Identified);
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_incidents_of_components_still_monitored() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        let cfg = web_config();
+        let c = check();
+        for t in 0..3 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let resolved = engine
+            .forget_unmonitored(&pool, &cfg, Some(&cfg), 50)
+            .await
+            .unwrap();
+        assert!(resolved.is_empty());
+        assert_eq!(db::active_incidents(&pool).await.unwrap().len(), 1);
+        assert!(engine.machines().contains_key("c1"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_resolves_incidents_of_removed_components() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let orphan = db::create_incident(
+            &pool,
+            "gone",
+            "Gone is down",
+            State::MajorOutage,
+            IncidentState::Investigating,
+            true,
+            0,
+        )
+        .await
+        .unwrap();
+        let kept = db::create_incident(
+            &pool,
+            "web",
+            "Web is down",
+            State::MajorOutage,
+            IncidentState::Investigating,
+            true,
+            0,
+        )
+        .await
+        .unwrap();
+        let manual = manual_incident(&pool, "gone").await;
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+
+        engine.bootstrap(&pool, &web_config()).await.unwrap();
+
+        let orphan = db::incident(&pool, orphan).await.unwrap().unwrap();
+        assert!(orphan.resolved_at.is_some());
+        let updates = db::incident_updates(&pool, orphan.id).await.unwrap();
+        // The old config is not available at startup, so the id stands in.
+        assert_eq!(
+            updates.last().unwrap().message,
+            "Resolved: gone is no longer monitored."
+        );
+        assert!(db::incident(&pool, kept)
+            .await
+            .unwrap()
+            .unwrap()
+            .resolved_at
+            .is_none());
+        assert!(db::incident(&pool, manual)
+            .await
+            .unwrap()
+            .unwrap()
+            .resolved_at
+            .is_none());
+        assert_eq!(engine.machines()["c1"].incident_id, Some(kept));
+        assert_eq!(rec.count(), 0);
     }
 }
 
