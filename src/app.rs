@@ -280,14 +280,6 @@ fn check_samples(check: &CheckConfig, outcome: &ProbeOutcome, now: i64) -> Vec<S
     out
 }
 
-fn component_for(cfg: &Config, check_id: &str) -> String {
-    cfg.components
-        .iter()
-        .find(|c| c.check.as_deref() == Some(check_id))
-        .map(|c| c.id.clone())
-        .unwrap_or_else(|| check_id.to_string())
-}
-
 pub async fn prober_loop(
     pool: Pool,
     config_rx: watch::Receiver<Arc<Config>>,
@@ -377,7 +369,7 @@ pub async fn prober_loop(
             }
             let _ = db::insert_samples(&pool, &check_samples(check, &outcome, now)).await;
 
-            let component = component_for(&cfg, &check.id);
+            let component = cfg.incident_component(&check.id);
             let muted = maintenance.iter().any(|m| m.covers(&component, now));
             if let Err(e) = engine
                 .lock()
