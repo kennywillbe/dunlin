@@ -229,12 +229,33 @@ pub fn probe_systemd(check: &CheckConfig, states: &[UnitStat]) -> ProbeOutcome {
 }
 
 /// Heartbeat check: late when nothing arrived within `period + grace`.
-pub fn probe_heartbeat(check: &CheckConfig, last_ping: Option<i64>, now: i64) -> ProbeOutcome {
+///
+/// Before the first ping ever arrives the clock runs from `watching_since`,
+/// when dunlin started watching the check, so a new nightly job gets its
+/// night instead of an incident three minutes after it is configured.
+pub fn probe_heartbeat(
+    check: &CheckConfig,
+    last_ping: Option<i64>,
+    watching_since: i64,
+    now: i64,
+) -> ProbeOutcome {
     let period = check.period.unwrap_or(Duration::from_secs(3600));
     let grace = check.grace.unwrap_or(Duration::from_secs(300));
     let allowed = period.saturating_add(grace).as_secs() as i64;
     match last_ping {
-        None => ProbeOutcome::down("no ping received yet"),
+        None => {
+            let waited = now - watching_since;
+            if waited > allowed {
+                ProbeOutcome::down(format!(
+                    "no ping received in {waited}s (allowed {allowed}s)"
+                ))
+            } else {
+                ProbeOutcome {
+                    message: Some("waiting for the first ping".to_string()),
+                    ..ProbeOutcome::up()
+                }
+            }
+        }
         Some(ts) => {
             let age = now - ts;
             if age > allowed {
@@ -570,9 +591,12 @@ mod tests {
             grace: Some(Duration::from_secs(300)),
             ..check(CheckType::Heartbeat)
         };
-        assert!(!probe_heartbeat(&c, None, 1000).ok);
-        assert!(probe_heartbeat(&c, Some(1000), 1000 + 3900).ok);
-        assert!(!probe_heartbeat(&c, Some(1000), 1000 + 3901).ok);
+        assert!(probe_heartbeat(&c, Some(1000), 0, 1000 + 3900).ok);
+        assert!(!probe_heartbeat(&c, Some(1000), 0, 1000 + 3901).ok);
+        // Never pinged: fine for one period + grace after watching began.
+        assert!(probe_heartbeat(&c, None, 1000, 1000).ok);
+        assert!(probe_heartbeat(&c, None, 1000, 1000 + 3900).ok);
+        assert!(!probe_heartbeat(&c, None, 1000, 1000 + 3901).ok);
     }
 
     #[test]
