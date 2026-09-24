@@ -956,3 +956,174 @@ async fn huge_maintenance_duration_is_clamped() {
     assert!(w.starts_at >= now - 5, "{w:?}");
     assert!(w.ends_at <= now + 366 * 86_400 + 5, "{w:?}");
 }
+
+async fn record_results(pool: &Pool, check_id: &str, ok: usize, failed: usize) {
+    let now = dunlin::now_ts();
+    for i in 0..ok + failed {
+        db::insert_check_result(
+            pool,
+            &dunlin::models::CheckResult {
+                // Oldest first, passing ones last, so the check is up now.
+                ts: now - 3600 + i as i64,
+                check_id: check_id.into(),
+                ok: i >= failed,
+                degraded: false,
+                latency_ms: Some(3.0),
+                message: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn state_badge_follows_the_status_page() {
+    let (state, pool) = state(false).await;
+    let app = app(state);
+
+    let (status, headers, body) = send(app.clone(), get("/badge/web.svg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[CONTENT_TYPE], "image/svg+xml");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["cache-control"], "no-cache");
+    assert!(body.starts_with("<svg"), "{body}");
+    assert!(body.contains(r#"role="img""#), "{body}");
+    assert!(
+        body.contains("<title>Website: operational</title>"),
+        "{body}"
+    );
+    assert!(body.contains("#2e9e5b"), "{body}");
+
+    // Maintenance wins over a healthy check, as on the status page.
+    let now = dunlin::now_ts();
+    let mnt = db::create_maintenance(&pool, "web", "", now - 60, now + 600, now)
+        .await
+        .unwrap();
+    let (_, _, body) = send(app.clone(), get("/badge/web.svg")).await;
+    assert!(
+        body.contains("<title>Website: maintenance</title>"),
+        "{body}"
+    );
+    assert!(body.contains("#2f64d8"), "{body}");
+    db::end_maintenance(&pool, mnt, now).await.unwrap();
+
+    // An incident on "All components" counts for this one too.
+    db::create_incident(
+        &pool,
+        "",
+        "Everything is on fire",
+        dunlin::models::State::PartialOutage,
+        dunlin::models::IncidentState::Investigating,
+        false,
+        now - 60,
+    )
+    .await
+    .unwrap();
+    let (_, _, body) = send(app.clone(), get("/badge/web.svg")).await;
+    assert!(
+        body.contains("<title>Website: partial outage</title>"),
+        "{body}"
+    );
+    assert!(body.contains("#e2461f"), "{body}");
+
+    let (status, headers, body) = send(app, get("/badge/web.json")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[CONTENT_TYPE], "application/json");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "label": "Website",
+            "message": "partial outage",
+            "color": "e2461f",
+        })
+    );
+}
+
+#[tokio::test]
+async fn uptime_badge_shows_the_90_day_figure() {
+    let (state, pool) = state(false).await;
+    let app = app(state);
+
+    let (status, headers, body) = send(app.clone(), get("/badge/web/uptime.svg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[CONTENT_TYPE], "image/svg+xml");
+    assert!(
+        body.contains("<title>Website uptime: no data</title>"),
+        "{body}"
+    );
+
+    record_results(&pool, "c1", 199, 1).await;
+    let (_, _, body) = send(app.clone(), get("/badge/web/uptime.svg")).await;
+    assert!(
+        body.contains("<title>Website uptime: 99.50%</title>"),
+        "{body}"
+    );
+    assert!(body.contains("#e0a21b"), "{body}");
+
+    // The status page prints the same figure.
+    let (_, _, page) = send(app, get("/")).await;
+    assert!(page.contains("99.50"), "{page}");
+}
+
+#[tokio::test]
+async fn unknown_badges_are_404() {
+    let (state, _pool) = state(false).await;
+    let app = app(state);
+    for (uri, kind) in [
+        ("/badge/nope.svg", "image/svg+xml"),
+        ("/badge/nope.json", "application/json"),
+        ("/badge/nope/uptime.svg", "image/svg+xml"),
+        ("/badge/web.png", "image/svg+xml"),
+    ] {
+        let (status, headers, _) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(headers[CONTENT_TYPE], kind, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn badge_text_is_escaped() {
+    let extra = "[[components]]\nid = \"odd\"\nname = 'A <&\"> B'\n";
+    let (state, _pool) =
+        state_from(test_config_with(false, extra, std::path::Path::new("."))).await;
+    let app = app(state);
+    for uri in ["/badge/odd.svg", "/badge/odd/uptime.svg"] {
+        let (status, _, body) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(!body.contains("A <&\"> B"), "{body}");
+        assert!(body.contains("A &lt;&amp;&quot;&gt; B"), "{body}");
+        let mut reader = quick_xml::Reader::from_str(&body);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("{uri} is not well-formed XML: {e}\n{body}"),
+            }
+        }
+    }
+    let (_, _, body) = send(app, get("/badge/odd.json")).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["label"], "A <&\"> B");
+}
+
+#[tokio::test]
+async fn protect_read_locks_badges() {
+    let (state, _pool) = state(true).await;
+    let app = app(state);
+    for uri in ["/badge/web.svg", "/badge/web.json", "/badge/web/uptime.svg"] {
+        let (status, headers, _) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(headers["location"], "/login", "{uri}");
+    }
+    let cookie = login(&app).await;
+    for uri in ["/badge/web.svg", "/badge/web.json", "/badge/web/uptime.svg"] {
+        let mut req = get(uri);
+        req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+        let (status, _, _) = send(app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+}

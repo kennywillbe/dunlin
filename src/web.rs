@@ -62,6 +62,8 @@ pub fn router(state: AppState) -> Router {
         .route("/incidents/{id}", get(incident_page))
         .route("/manage", get(manage_page))
         .route("/feed.xml", get(feed))
+        .route("/badge/{file}", get(badge))
+        .route("/badge/{component}/uptime.svg", get(uptime_badge))
         .route("/health", get(health))
         .route("/assets/{file}", get(asset))
         .route("/assets/fonts/{file}", get(font))
@@ -436,15 +438,28 @@ fn kind_word(kind: CheckType) -> &'static str {
     }
 }
 
-async fn build_component(
+/// A component's state and 90-day uptime, as both the status page and the
+/// badges show them, so the two can never disagree.
+struct ComponentNow<'a> {
+    check: Option<&'a crate::config::CheckConfig>,
+    state: CompState,
+    /// `uptime_slots` since `from`, for the day bars.
+    daily: Vec<(i64, i64, i64)>,
+    uptime_90: Option<f64>,
+    last: Option<crate::models::CheckResult>,
+    since: Option<i64>,
+    window: Option<&'a crate::models::Maintenance>,
+}
+
+async fn component_now<'a>(
     pool: &Pool,
-    cfg: &Config,
+    cfg: &'a Config,
     comp: &crate::config::ComponentConfig,
-    maintenance: &[crate::models::Maintenance],
+    maintenance: &'a [crate::models::Maintenance],
     active: &[crate::models::Incident],
-    history: &History,
+    from: i64,
     now: i64,
-) -> (ComponentView, crate::sentence::Snapshot) {
+) -> ComponentNow<'a> {
     let check = comp.check.as_ref().and_then(|id| cfg.check(id));
 
     let (base, daily, last) = match check {
@@ -454,7 +469,6 @@ async fn build_component(
                 .await
                 .unwrap_or(0);
             let base = status::check_state(last.as_ref(), failures, check.failures_to_open);
-            let from = history.days.first().map_or(now, |d| d.start);
             let slots = db::uptime_slots(pool, &check.id, from)
                 .await
                 .unwrap_or_default();
@@ -464,7 +478,7 @@ async fn build_component(
     };
     let total: i64 = daily.iter().map(|(_, t, _)| t).sum();
     let up: i64 = daily.iter().map(|(_, _, u)| u).sum();
-    let uptime_90 = (total > 0).then(|| format_pct(up as f64 / total as f64 * 100.0));
+    let uptime_90 = (total > 0).then(|| up as f64 / total as f64 * 100.0);
 
     let window = maintenance.iter().find(|m| m.covers(&comp.id, now));
     let mine: Vec<&crate::models::Incident> = active
@@ -474,6 +488,37 @@ async fn build_component(
     let impact = mine.iter().map(|i| i.impact).max();
     let state = status::component_state(base, window.is_some(), impact);
     let since = mine.iter().map(|i| i.created_at).min();
+    ComponentNow {
+        check,
+        state,
+        daily,
+        uptime_90,
+        last,
+        since,
+        window,
+    }
+}
+
+async fn build_component(
+    pool: &Pool,
+    cfg: &Config,
+    comp: &crate::config::ComponentConfig,
+    maintenance: &[crate::models::Maintenance],
+    active: &[crate::models::Incident],
+    history: &History,
+    now: i64,
+) -> (ComponentView, crate::sentence::Snapshot) {
+    let from = history.days.first().map_or(now, |d| d.start);
+    let ComponentNow {
+        check,
+        state,
+        daily,
+        uptime_90,
+        last,
+        since,
+        window,
+    } = component_now(pool, cfg, comp, maintenance, active, from, now).await;
+    let uptime_90 = uptime_90.map(format_pct);
     let latency = last.as_ref().and_then(|r| r.latency_ms);
 
     let (sub, sub_class) = match state {
@@ -1182,6 +1227,119 @@ const NOSNIFF: (HeaderName, HeaderValue) = (
     HeaderName::from_static("x-content-type-options"),
     HeaderValue::from_static("nosniff"),
 );
+
+/// Access check for badges. Badges are embedded where no session cookie is
+/// sent (READMEs, other dashboards), so this is where API keys will be
+/// accepted under `protect_read`; until then it is the read-page guard.
+async fn badge_guard(state: &AppState, jar: &CookieJar) -> Option<Response> {
+    read_guard(state, jar).await
+}
+
+enum BadgeFormat {
+    Svg,
+    Json,
+}
+
+fn badge_response(
+    status: StatusCode,
+    format: BadgeFormat,
+    badge: &crate::badge::Badge,
+) -> Response {
+    let (content_type, body) = match format {
+        BadgeFormat::Svg => ("image/svg+xml", badge.svg()),
+        BadgeFormat::Json => ("application/json", badge.endpoint_json()),
+    };
+    (
+        status,
+        [
+            (CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            // A badge is only useful if it is current, and camo (GitHub's
+            // image proxy) caches for as long as it is allowed to.
+            (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            NOSNIFF,
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn badge_not_found(format: BadgeFormat) -> Response {
+    let badge = crate::badge::Badge {
+        label: "badge".to_string(),
+        message: "not found".to_string(),
+        color: crate::badge::NO_DATA,
+    };
+    badge_response(StatusCode::NOT_FOUND, format, &badge)
+}
+
+/// The component's current state and 90-day uptime, as the status page
+/// computes them.
+async fn badge_facts(
+    state: &AppState,
+    cfg: &Config,
+    id: &str,
+) -> Option<(String, CompState, Option<f64>)> {
+    let comp = cfg.component(id)?;
+    let now = crate::now_ts();
+    let windows = db::current_and_upcoming_maintenance(&state.pool, now)
+        .await
+        .unwrap_or_default();
+    let active = db::active_incidents(&state.pool).await.unwrap_or_default();
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, cfg.tz());
+    let from = strip.first().map_or(now, |d| d.start);
+    let c = component_now(&state.pool, cfg, comp, &windows, &active, from, now).await;
+    Some((comp.name.clone(), c.state, c.uptime_90))
+}
+
+/// `/badge/{component}.svg` and `/badge/{component}.json`: current state.
+async fn badge(
+    State(state): State<AppState>,
+    Path(file): Path<String>,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = badge_guard(&state, &jar).await {
+        return r;
+    }
+    let (id, format) = match file.rsplit_once('.') {
+        Some((id, "svg")) => (id, BadgeFormat::Svg),
+        Some((id, "json")) => (id, BadgeFormat::Json),
+        _ => return badge_not_found(BadgeFormat::Svg),
+    };
+    let cfg = state.cfg();
+    let Some((name, comp_state, _)) = badge_facts(&state, &cfg, id).await else {
+        return badge_not_found(format);
+    };
+    let badge = crate::badge::Badge {
+        label: name,
+        message: crate::badge::state_message(comp_state),
+        color: comp_state.rgb(),
+    };
+    badge_response(StatusCode::OK, format, &badge)
+}
+
+/// `/badge/{component}/uptime.svg`: the status page's 90-day uptime figure.
+async fn uptime_badge(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = badge_guard(&state, &jar).await {
+        return r;
+    }
+    let cfg = state.cfg();
+    let Some((name, _, uptime)) = badge_facts(&state, &cfg, &id).await else {
+        return badge_not_found(BadgeFormat::Svg);
+    };
+    let shown = uptime.map(format_pct);
+    // Colour by the figure as shown, so "99.90%" never gets the band below.
+    let color = crate::badge::uptime_color(shown.as_deref().and_then(|s| s.parse().ok()));
+    let badge = crate::badge::Badge {
+        label: format!("{name} uptime"),
+        message: shown.map_or_else(|| "no data".to_string(), |s| format!("{s}%")),
+        color,
+    };
+    badge_response(StatusCode::OK, BadgeFormat::Svg, &badge)
+}
 
 async fn asset(State(state): State<AppState>, Path(file): Path<String>) -> Response {
     // Files that follow the config are revalidated so a hot reload shows up.

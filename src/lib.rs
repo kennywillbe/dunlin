@@ -8,6 +8,7 @@ pub fn now_ts() -> i64 {
 pub mod alert;
 pub mod app;
 pub mod auth;
+pub mod badge;
 pub mod collector;
 pub mod config;
 pub mod days;

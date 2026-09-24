@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use crate::config::{Config, NotifierConfig};
-use crate::models::{Notification, State};
+use crate::models::Notification;
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
@@ -199,18 +199,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// Colour of a state, taken from the status page palette. Operational has no
-/// colour there (it is the calm default), so notifications use a green.
-fn state_rgb(state: State) -> u32 {
-    match state {
-        State::Operational => 0x2e9e5b,
-        State::Maintenance => 0x2f64d8,
-        State::Degraded => 0xe0a21b,
-        State::PartialOutage => 0xe2461f,
-        State::MajorOutage => 0xb8121d,
-    }
-}
-
 /// Longest wait honoured on a 429 before the single retry.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(5);
 
@@ -355,7 +343,7 @@ impl DiscordNotifier {
         let mut embed = serde_json::json!({
             "title": truncate_chars(&n.title, 256),
             "description": truncate_chars(n.text(), 4096),
-            "color": state_rgb(n.state),
+            "color": n.state.rgb(),
             "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         });
         if let Some(link) = &n.link {
@@ -408,7 +396,7 @@ impl SlackNotifier {
     fn payload(n: &Notification) -> serde_json::Value {
         let title = slack_escape(&n.title);
         let mut attachment = serde_json::json!({
-            "color": format!("#{:06x}", state_rgb(n.state)),
+            "color": format!("#{:06x}", n.state.rgb()),
             "title": title,
             "text": slack_escape(n.text()),
             "ts": chrono::Utc::now().timestamp(),
@@ -577,6 +565,7 @@ pub fn build_notifiers(cfg: &Config, client: &reqwest::Client) -> Vec<Arc<dyn No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use std::collections::VecDeque;

@@ -16,8 +16,8 @@ Licensed under MIT OR Apache-2.0.
 - **Status page**: component groups, five states (operational, degraded,
   partial outage, major outage, maintenance), overall banner, 90-day uptime
   bars, active incidents and maintenance, 14 days of past incidents, Atom
-  feed. A plain sentence at the top says what is wrong right now. Title,
-  accent, logo and extra CSS from the config.
+  feed, SVG status and uptime badges. A plain sentence at the top says what
+  is wrong right now. Title, accent, logo and extra CSS from the config.
 - **Alerts**: per-check failure / recovery / reminder thresholds, incidents
   opened and resolved automatically, optional maintenance windows that mute
   notifications, Telegram, ntfy, Discord, Slack, Pushover and webhook
@@ -172,6 +172,24 @@ Each webhook notification is an HTTP `POST` with a JSON body. Any headers under
 - `incident_id`: the incident the event belongs to, or `null` (daily summary).
   With `public_url` set, `message` ends with a link to that incident's page.
 - `timestamp`: Unix seconds.
+
+## Badges
+
+Each component has badges for READMEs and other dashboards, showing the same
+state and 90-day uptime as the status page:
+
+- `/badge/<component>.svg`: current state, e.g. `Website | operational`
+- `/badge/<component>/uptime.svg`: 90-day uptime; green from 99.9%, amber
+  from 99%, orange from 95%, red below
+- `/badge/<component>.json`: the state in the
+  [shields.io endpoint](https://shields.io/badges/endpoint-badge) format
+
+```markdown
+![Website](https://status.example.org/badge/homepage.svg)
+```
+
+`<component>` is the component `id`. With `protect_read = true` badges need a
+logged-in session, like every other read page.
 
 ## CLI
 

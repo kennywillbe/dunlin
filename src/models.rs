@@ -34,6 +34,19 @@ impl State {
         }
     }
 
+    /// Colour for notifications and badges, taken from the status page
+    /// palette. Operational has no colour there (it is the calm default), so
+    /// a green stands in.
+    pub fn rgb(self) -> u32 {
+        match self {
+            State::Operational => 0x2e9e5b,
+            State::Maintenance => 0x2f64d8,
+            State::Degraded => 0xe0a21b,
+            State::PartialOutage => 0xe2461f,
+            State::MajorOutage => 0xb8121d,
+        }
+    }
+
     pub fn from_name(s: &str) -> Option<State> {
         Some(match s {
             "operational" => State::Operational,
