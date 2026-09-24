@@ -24,6 +24,10 @@ proc_root = "/proc"
 # Default: false
 trusted_proxy = false
 
+# Public address of this status page. Notifications link to the incident
+# under it, and the Atom feed uses it for its links. Optional.
+# public_url = "https://status.example.org"
+
 # Mark the session cookie Secure (only when serving over HTTPS).
 # Default: false
 secure_cookies = false

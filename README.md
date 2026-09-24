@@ -145,6 +145,7 @@ Each webhook notification is an HTTP `POST` with a JSON body. Any headers under
 - `state`: the component state at the time, one of `operational`, `degraded`,
   `partial_outage`, `major_outage`, `maintenance`.
 - `incident_id`: the incident the event belongs to, or `null` (daily summary).
+  With `public_url` set, `message` ends with a link to that incident's page.
 - `timestamp`: Unix seconds.
 
 ## CLI
