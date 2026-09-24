@@ -34,6 +34,7 @@ pub async fn run_once(pool: &Pool, now: i64, raw_days: u32, hourly_days: u32) ->
     db::prune_hourly_before(pool, now - hourly_days as i64 * 86_400).await?;
     db::prune_check_results_before(pool, now - result_days(hourly_days) * 86_400).await?;
     db::prune_sessions(pool, now).await?;
+    crate::subscriptions::prune(pool, now).await?;
     Ok(())
 }
 

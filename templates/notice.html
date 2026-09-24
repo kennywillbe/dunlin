@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} · {% endblock %}
+{% block content %}
+<section class="plain-page" aria-labelledby="notice-title">
+  <h2 id="notice-title" class="form-title">{{ heading }}</h2>
+  {% for p in paragraphs %}<p>{{ p }}</p>
+  {% endfor %}
+  {% if let Some(a) = action %}<form method="post" action="{{ a.url }}" class="form narrow-form">
+    <div class="actions"><button class="button primary" type="submit">{{ a.label }}</button></div>
+  </form>{% endif %}
+  <p class="back"><a href="/">Back to the status page</a></p>
+</section>
+{% endblock %}

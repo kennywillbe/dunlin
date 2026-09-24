@@ -127,6 +127,11 @@ Authorization = "Bearer REPLACE"
 # name = "grafana"                 # shown in logs
 # hash = "REPLACE"                 # sha256 of the token, lowercase hex
 
+# Let visitors subscribe to incident and maintenance updates on /subscribe.
+# Needs public_url; each channel gets its own [subscriptions.<channel>] table.
+# [subscriptions]
+# enabled = false
+
 # Groups organise components on the status page.
 [[groups]]
 id = "core"

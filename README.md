@@ -20,8 +20,8 @@ Licensed under MIT OR Apache-2.0.
   is wrong right now. Title, accent, logo and extra CSS from the config.
 - **Alerts**: per-check failure / recovery / reminder thresholds, incidents
   opened and resolved automatically, maintenance windows (now or planned
-  ahead) that mute notifications while open, Telegram, ntfy, Discord, Slack, Pushover and webhook
-  notifiers, a daily summary.
+  ahead) that mute notifications while open, Telegram, ntfy, Discord, Slack,
+  Pushover and webhook notifiers, a daily summary, visitor subscriptions.
 - **History**: raw per-minute samples for 7 days and hourly aggregates for
   90 days by default; probe results as long as the hourly aggregates, and at
   least the 90 days the status page shows; charts for host, containers and
@@ -179,6 +179,35 @@ Each webhook notification is an HTTP `POST` with a JSON body. Any headers under
 - `incident_id`: the incident the event belongs to, or `null` (daily summary).
   With `public_url` set, `message` ends with a link to that incident's page.
 - `timestamp`: Unix seconds.
+
+## Subscriptions
+
+Visitors can sign up on `/subscribe` to hear about incidents (opened, every
+update, resolved, automatic ones included) and, if they tick the box, about
+maintenance (planned ahead, started, completed, or called off before it
+began). They pick all components or some; an incident on all components goes
+to everyone. An automatic incident opened during maintenance is not sent at
+all, like the operator alerts it would have caused. Nothing is sent until
+they open the confirmation link, which works for 24 hours, and every message
+carries a link to unsubscribe.
+
+Subscriptions are off by default and need `public_url`, since the links point
+there:
+
+```toml
+[subscriptions]
+enabled = true
+```
+
+Each channel (email, webhook, Telegram) is switched on in its own
+`[subscriptions.<channel>]` table; until one is, the page says subscriptions
+are not available. Messages go out from a queue in the database, so they
+survive a restart; a failed send is retried with growing gaps for about an
+hour. The sign-up form is limited to 5 attempts per address an hour and never
+says whether an address was already subscribed. With `protect_read = true`
+only logged-in visitors can sign up, but confirmation and unsubscribe links
+work for anyone. `/manage` lists subscribers with their addresses shortened
+and can remove them.
 
 ## Badges
 

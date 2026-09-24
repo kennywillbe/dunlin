@@ -81,6 +81,27 @@
   {% endif %}
 </section>
 
+{% if let Some(subs) = subscribers %}
+<section class="log" aria-labelledby="subscribers">
+  <h2 id="subscribers" class="log-title">Subscribers</h2>
+  {% if subs.rows.is_empty() %}
+  <div class="entry"><span class="d"></span><p class="q">None yet.</p></div>
+  {% else %}
+  <p class="soft counts">{% for c in subs.counts %}{{ c.channel }}: {{ c.active }} active, {{ c.pending }} pending{% if c.quarantined > 0 %}, {{ c.quarantined }} quarantined{% endif %}{% if !loop.last %} · {% endif %}{% endfor %}</p>
+  {% for r in subs.rows %}
+  <div class="entry row-with-action">
+    <span class="d">{{ r.status }}</span>
+    <div class="items">
+      <p class="item"><span class="t">{{ r.masked }}</span> <span class="m">— {{ r.channel }}</span></p>
+      <p class="m sub">{{ r.about }}</p>
+    </div>
+    <form method="post" action="/manage/subscribers/{{ r.id }}/delete" class="inline"><button class="button small" type="submit">Delete</button></form>
+  </div>
+  {% endfor %}
+  {% endif %}
+</section>
+{% endif %}
+
 <section class="log" aria-labelledby="open-incidents">
   <h2 id="open-incidents" class="log-title">Open incidents</h2>
   {% if active_incidents.is_empty() %}

@@ -22,6 +22,7 @@ pub mod prometheus;
 pub mod rollup;
 pub mod sentence;
 pub mod status;
+pub mod subscriptions;
 pub mod summary;
 pub mod systemd;
 pub mod templates;

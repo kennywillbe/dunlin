@@ -24,9 +24,16 @@ use crate::days::Day;
 use crate::db::{self, Pool};
 use crate::models::State as CompState;
 use crate::status;
+use crate::subscriptions::{self, IncidentChange};
+
+mod subscribe;
 use crate::templates::*;
 use crate::web_auth::{
     clear_session_cookie, client_ip, csrf_ok, session_cookie, LoginLimiter, SESSION_COOKIE,
+};
+use subscribe::{
+    confirm_page, confirm_submit, delete_subscriber, subscribe_page, subscribe_submit,
+    unsubscribe_page, unsubscribe_submit,
 };
 
 #[derive(Clone)]
@@ -34,7 +41,16 @@ pub struct AppState {
     pub pool: Pool,
     pub config: watch::Receiver<Arc<Config>>,
     pub limiter: Arc<LoginLimiter>,
+    /// Sign-ups per client address, separate from logins.
+    pub subscribe_limiter: Arc<LoginLimiter>,
+    /// Subscription channels that are switched on.
+    pub channels: Arc<crate::subscriptions::dispatch::Channels>,
 }
+
+/// Sign-up attempts one address may make per `SUBSCRIBE_WINDOW_SECS`. Each
+/// one can send a message to someone, so the form is not a free relay.
+pub const SUBSCRIBE_MAX: usize = 5;
+pub const SUBSCRIBE_WINDOW_SECS: i64 = 3600;
 
 impl AppState {
     /// Returns the state and the sender used to hot-reload the config.
@@ -45,6 +61,11 @@ impl AppState {
                 pool,
                 config: rx,
                 limiter: Arc::new(LoginLimiter::new()),
+                subscribe_limiter: Arc::new(LoginLimiter::with_limits(
+                    SUBSCRIBE_MAX,
+                    SUBSCRIBE_WINDOW_SECS,
+                )),
+                channels: Arc::default(),
             },
             tx,
         )
@@ -81,6 +102,16 @@ pub fn router(state: AppState) -> Router {
         .route("/incidents/{id}/resolve", post(resolve_incident))
         .route("/maintenance", post(start_maintenance))
         .route("/maintenance/{id}/end", post(end_maintenance))
+        .route("/subscribe", get(subscribe_page).post(subscribe_submit))
+        .route(
+            "/subscribe/confirm/{token}",
+            get(confirm_page).post(confirm_submit),
+        )
+        .route(
+            "/unsubscribe/{token}",
+            get(unsubscribe_page).post(unsubscribe_submit),
+        )
+        .route("/manage/subscribers/{id}/delete", post(delete_subscriber))
         .fallback(not_found)
         .with_state(state)
 }
@@ -1229,6 +1260,7 @@ async fn manage_page(State(state): State<AppState>, jar: CookieJar) -> Response 
         maintenance: maintenance_views(&cfg, &windows, now),
         active_incidents: incident_views(&state.pool, &cfg, &active, now).await,
         timezone: cfg.tz().name().to_string(),
+        subscribers: subscribe::subscribers_view(&state, &cfg).await,
     })
 }
 
@@ -2076,6 +2108,15 @@ async fn create_incident(
     {
         return internal(&state, e);
     }
+    subscriptions::publish_incident(
+        &state.pool,
+        &state.cfg(),
+        id,
+        IncidentChange::Opened,
+        &message,
+        now,
+    )
+    .await;
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
@@ -2108,6 +2149,15 @@ async fn add_update(
     } else if let Err(e) = db::set_incident_state(&state.pool, id, new_state).await {
         return internal(&state, e);
     }
+    subscriptions::publish_incident(
+        &state.pool,
+        &state.cfg(),
+        id,
+        subscriptions::change_for(new_state),
+        &form.message,
+        now,
+    )
+    .await;
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
@@ -2136,6 +2186,15 @@ async fn resolve_incident(
     {
         return internal(&state, e);
     }
+    subscriptions::publish_incident(
+        &state.pool,
+        &state.cfg(),
+        id,
+        IncidentChange::Resolved,
+        "Resolved by operator.",
+        now,
+    )
+    .await;
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
@@ -2207,7 +2266,7 @@ async fn start_maintenance(
         // minutes back is just a form filled in slowly, so the past is now.
         ts.clamp(now, now + MAX_MAINTENANCE_SECS)
     };
-    if let Err(e) = db::create_maintenance(
+    let id = match db::create_maintenance(
         &state.pool,
         &form.component,
         &form.note,
@@ -2217,7 +2276,13 @@ async fn start_maintenance(
     )
     .await
     {
-        return internal(&state, e);
+        Ok(id) => id,
+        Err(e) => return internal(&state, e),
+    };
+    // A window starting now is announced as started by the dispatcher's
+    // next check; only one planned for later is "scheduled".
+    if starts > now {
+        subscriptions::publish_scheduled(&state.pool, &state.cfg(), id, now).await;
     }
     Redirect::to("/manage").into_response()
 }

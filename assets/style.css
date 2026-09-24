@@ -263,6 +263,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-bottom-color: 
 .button.primary:hover { background: var(--ink); border-color: var(--ink); color: var(--bg); }
 .button.small { padding: 4px 12px; font-size: 13.5px; }
 .alert { margin-top: 16px; color: var(--down); font-weight: 600; }
+fieldset { border: 0; padding: 0; margin: 0; }
+legend { font-size: 14px; font-weight: 600; padding: 0; margin-bottom: 4px; }
+.choices { gap: 6px; }
+.choice { display: flex; align-items: baseline; gap: 8px; font-weight: 400; font-size: 15px; }
+.choice input { width: auto; border: 0; padding: 0; margin: 0; accent-color: var(--accent); }
+.choice input:focus { box-shadow: none; outline: 2px solid var(--accent); outline-offset: 2px; }
+/* The honeypot: out of sight for people, still filled in by form bots. */
+.hp { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
+.counts { margin-bottom: 12px; }
 .resolve-form { margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--hair); display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; font-size: 14.5px; }
 .timeline + .form-section { margin-top: 56px; }
 

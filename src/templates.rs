@@ -98,6 +98,8 @@ pub struct SiteView {
     /// Current nav section, for `aria-current`.
     pub section: &'static str,
     pub logo_svg: &'static str,
+    /// Show the "Subscribe" link.
+    pub subscribe: bool,
 }
 
 impl SiteView {
@@ -110,6 +112,7 @@ impl SiteView {
             logged_in,
             section,
             logo_svg: crate::theme::LOGO_SVG,
+            subscribe: cfg.subscriptions.enabled,
         }
     }
 }
@@ -366,6 +369,80 @@ pub struct ManageTemplate {
     pub active_incidents: Vec<IncidentView>,
     /// Zone the "Starts at" field is read in, named on its label.
     pub timezone: String,
+    /// `None` when subscriptions are off and nobody is subscribed.
+    pub subscribers: Option<SubscribersView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscribersView {
+    pub counts: Vec<ChannelCount>,
+    pub rows: Vec<SubscriberRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelCount {
+    pub channel: String,
+    pub active: usize,
+    pub pending: usize,
+    pub quarantined: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscriberRow {
+    pub id: i64,
+    pub channel: String,
+    pub masked: String,
+    pub status: String,
+    /// "All components", or the chosen ones, plus maintenance.
+    pub about: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelChoice {
+    pub name: String,
+    pub label: String,
+    pub hint: String,
+    pub checked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComponentChoice {
+    pub id: String,
+    pub name: String,
+    pub checked: bool,
+}
+
+#[derive(Template)]
+#[template(path = "subscribe.html")]
+pub struct SubscribeTemplate {
+    pub site: SiteView,
+    pub side: SideView,
+    /// Empty when no channel is switched on.
+    pub channels: Vec<ChannelChoice>,
+    pub components: Vec<ComponentChoice>,
+    pub address: String,
+    pub all: bool,
+    pub maintenance: bool,
+    pub error: Option<String>,
+}
+
+/// A button on a notice page that posts back to `url`.
+#[derive(Debug, Clone)]
+pub struct NoticeAction {
+    pub url: String,
+    pub label: String,
+}
+
+/// A heading, a few sentences and maybe one button: the pages around
+/// subscribing, confirming and unsubscribing.
+#[derive(Template)]
+#[template(path = "notice.html")]
+pub struct NoticeTemplate {
+    pub site: SiteView,
+    pub side: SideView,
+    pub heading: String,
+    pub paragraphs: Vec<String>,
+    pub action: Option<NoticeAction>,
 }
 
 #[derive(Template)]

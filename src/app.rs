@@ -153,6 +153,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let notifiers = Arc::new(MultiNotifier::new(build_notifiers(&cfg, &http)));
 
     let mut engine = AlertEngine::new(notifiers.clone(), cfg.public_url.clone());
+    engine.set_subscriptions(cfg.clone());
     engine.bootstrap(&pool, &cfg).await?;
     let engine = Arc::new(Mutex::new(engine));
 
@@ -174,6 +175,14 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         http.clone(),
     ));
     tokio::spawn(rollup_loop(pool.clone(), config_rx.clone()));
+    state
+        .channels
+        .replace(crate::subscriptions::dispatch::build_channels(&cfg));
+    tokio::spawn(crate::subscriptions::dispatch::dispatcher_loop(
+        pool.clone(),
+        config_rx.clone(),
+        state.channels.clone(),
+    ));
     tokio::spawn(summary_loop(
         pool.clone(),
         config_rx.clone(),
@@ -469,6 +478,7 @@ pub async fn prober_loop(
             let muted = muted(&maintenance, &component, now);
             let mut engine = engine.lock().await;
             engine.set_public_url(cfg.public_url.clone());
+            engine.set_subscriptions(cfg.clone());
             if let Err(e) = engine
                 .handle(
                     &pool,

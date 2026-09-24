@@ -293,6 +293,15 @@ pub enum NotifierConfig {
     },
 }
 
+/// `[subscriptions]`: visitors signing up for incident and maintenance news.
+/// The channels they can pick have their own sub-tables.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// `[[api_keys]]`: read access for scripts, dashboards and scrapers.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -475,6 +484,8 @@ pub struct Config {
     #[serde(default)]
     pub api_keys: Vec<ApiKeyConfig>,
     #[serde(default)]
+    pub subscriptions: SubscriptionsConfig,
+    #[serde(default)]
     pub groups: Vec<GroupConfig>,
     #[serde(default)]
     pub components: Vec<ComponentConfig>,
@@ -512,6 +523,7 @@ impl Default for Config {
             systemd: SystemdConfig::default(),
             notifiers: Vec::new(),
             api_keys: Vec::new(),
+            subscriptions: SubscriptionsConfig::default(),
             groups: Vec::new(),
             components: Vec::new(),
             checks: Vec::new(),
@@ -748,6 +760,13 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 }
             }
         }
+    }
+
+    if cfg.subscriptions.enabled && cfg.public_url.is_none() {
+        errs.push(
+            "subscriptions need public_url: confirmation and unsubscribe links point there"
+                .to_string(),
+        );
     }
 
     let mut key_names = HashSet::new();
@@ -1040,6 +1059,26 @@ user = "me"
         // A missing required key is a parse error rather than a validation one.
         assert!(parse_str(&with("type = \"pushover\"\ntoken = \"t\"")).is_err());
         assert!(parse_str(&with("type = \"ntfy\"\nurl = \"https://ntfy.sh\"")).is_err());
+    }
+
+    #[test]
+    fn subscriptions_default_off_and_need_public_url() {
+        assert!(
+            !parse_str(&base_with_real_hash())
+                .unwrap()
+                .subscriptions
+                .enabled
+        );
+        let on = format!(
+            "{}\n[subscriptions]\nenabled = true\n",
+            base_with_real_hash()
+        );
+        let err = parse_str(&on).unwrap_err().to_string();
+        assert!(err.contains("subscriptions need public_url"), "{err}");
+        let with_url = format!("public_url = \"https://status.example.org\"\n{on}");
+        assert!(parse_str(&with_url).unwrap().subscriptions.enabled);
+        let bogus = format!("{}\n[subscriptions]\nbogus = 1\n", base_with_real_hash());
+        assert!(parse_str(&bogus).is_err());
     }
 
     #[test]

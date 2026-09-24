@@ -1785,3 +1785,547 @@ async fn maintenance_start_defaults_clamps_and_rejects() {
     assert!(body.contains("not valid"), "{body}");
     assert_eq!(db::all_maintenance(&pool).await.unwrap().len(), windows);
 }
+
+// -- subscriptions -----------------------------------------------------------
+
+mod subs {
+    use super::*;
+    use async_trait::async_trait;
+    use dunlin::subscriptions::dispatch::{
+        dispatch_due, Channels, Delivery, Message, Pacer, SubscriberChannel,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    pub struct Fake {
+        pub sent: Mutex<Vec<Delivery>>,
+    }
+
+    #[async_trait]
+    impl SubscriberChannel for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn label(&self) -> &str {
+            "Fake channel"
+        }
+        fn address_hint(&self) -> &str {
+            "an address with an @"
+        }
+        fn normalize_address(&self, input: &str) -> Result<String, String> {
+            let a = input.trim().to_lowercase();
+            if a.contains('@') {
+                Ok(a)
+            } else {
+                Err("That does not look like an address.".to_string())
+            }
+        }
+        async fn send(&self, delivery: &Delivery) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(delivery.clone());
+            Ok(())
+        }
+    }
+
+    pub fn subs_config(enabled: bool, protect_read: bool) -> Arc<Config> {
+        let toml = format!(
+            "public_url = \"https://status.example.org\"\n{}",
+            config_toml(
+                protect_read,
+                &format!(
+                    "[[components]]\nid = \"db\"\nname = \"Database\"\n\n[subscriptions]\nenabled = {enabled}\n"
+                )
+            )
+        );
+        Arc::new(config::parse_str(&toml).unwrap())
+    }
+
+    /// App with subscriptions on and the fake channel registered.
+    pub async fn setup(protect_read: bool) -> (Router, AppState, Pool, Arc<Fake>) {
+        let (state, pool) = state_from(subs_config(true, protect_read)).await;
+        let fake = Arc::new(Fake::default());
+        state
+            .channels
+            .replace(vec![fake.clone() as Arc<dyn SubscriberChannel>]);
+        (app(state.clone()), state, pool, fake)
+    }
+
+    pub fn subscribe_req(body: &str) -> Request<Body> {
+        post_form("/subscribe", body)
+    }
+
+    /// Run the dispatcher once and return the path of the newest link of
+    /// the given kind it sent.
+    pub async fn deliver(state: &AppState, fake: &Fake) -> Vec<Delivery> {
+        let cfg = state.cfg();
+        let channels = Channels::default();
+        channels.replace(state.channels.list());
+        dispatch_due(
+            &state.pool,
+            &cfg,
+            &channels,
+            &mut Pacer::default(),
+            dunlin::now_ts(),
+        )
+        .await
+        .unwrap();
+        fake.sent.lock().unwrap().clone()
+    }
+
+    pub fn confirm_path(d: &Delivery) -> String {
+        match &d.message {
+            Message::Confirm { confirm_url, .. } => confirm_url
+                .strip_prefix("https://status.example.org")
+                .unwrap()
+                .to_string(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    pub fn unsubscribe_path(d: &Delivery) -> String {
+        let url = match &d.message {
+            Message::Confirm {
+                unsubscribe_url, ..
+            }
+            | Message::Event {
+                unsubscribe_url, ..
+            } => unsubscribe_url,
+        };
+        url.strip_prefix("https://status.example.org")
+            .unwrap()
+            .to_string()
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_off_means_404_and_no_link() {
+    let (state, _pool) = state_from(subs::subs_config(false, false)).await;
+    let app = app(state);
+    for uri in ["/subscribe", "/subscribe/confirm/abc", "/unsubscribe/abc"] {
+        let (status, _, body) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(body.contains("Page not found"), "{uri}");
+    }
+    for uri in ["/subscribe", "/subscribe/confirm/abc", "/unsubscribe/abc"] {
+        let (status, _, _) = send(app.clone(), post_form(uri, "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "POST {uri}");
+    }
+    let (_, _, body) = send(app, get("/")).await;
+    assert!(!body.contains("href=\"/subscribe\""), "{body}");
+}
+
+#[tokio::test]
+async fn subscribe_page_without_channels_says_so() {
+    let (state, _pool) = state_from(subs::subs_config(true, false)).await;
+    let app = app(state);
+    let (status, _, body) = send(app.clone(), get("/subscribe")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Subscriptions are not available yet."),
+        "{body}"
+    );
+    assert!(!body.contains("<form method=\"post\" action=\"/subscribe\""));
+    let (_, _, body) = send(app, get("/")).await;
+    assert!(
+        body.contains("<a href=\"/subscribe\">Subscribe</a>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_confirm_and_unsubscribe() {
+    let (app, state, pool, fake) = subs::setup(false).await;
+    let (status, _, body) = send(app.clone(), get("/subscribe")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("value=\"fake\" checked"), "{body}");
+    assert!(body.contains("Fake channel"), "{body}");
+    assert!(body.contains("value=\"web\""), "{body}");
+    assert!(body.contains("value=\"db\""), "{body}");
+    assert!(body.contains("name=\"website\""), "{body}");
+
+    let (status, _, body) = send(
+        app.clone(),
+        subs::subscribe_req(
+            "channel=fake&address=Me%40Example.org&components=db&maintenance=1&website=",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Check for a confirmation"), "{body}");
+    let listed = dunlin::subscriptions::list(&pool).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].address, "me@example.org");
+    assert_eq!(listed[0].components, ["db"]);
+    assert!(!listed[0].all_components && listed[0].maintenance);
+
+    let sent = subs::deliver(&state, &fake).await;
+    assert_eq!(sent.len(), 1);
+    let confirm = subs::confirm_path(&sent[0]);
+    // Opening the link only shows a button; mail scanners open links too.
+    let (status, _, body) = send(app.clone(), get(&confirm)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&format!("action=\"{confirm}\"")), "{body}");
+    assert_eq!(
+        dunlin::subscriptions::list(&pool).await.unwrap()[0].status,
+        "pending"
+    );
+    // Token routes work without an Origin header or a session.
+    let req = Request::builder()
+        .method("POST")
+        .uri(&confirm)
+        .header(HOST, "localhost")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("You are subscribed"), "{body}");
+    assert_eq!(
+        dunlin::subscriptions::list(&pool).await.unwrap()[0].status,
+        "active"
+    );
+    let (status, _, _) = send(app.clone(), get(&confirm)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a used link is gone");
+
+    // A manual incident on the chosen component reaches the subscriber.
+    let cookie = login(&app).await;
+    let mut req = post_form(
+        "/incidents",
+        "title=DB+slow&component=db&state=degraded&message=Looking",
+    );
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    send(app.clone(), req).await;
+    let sent = subs::deliver(&state, &fake).await;
+    assert_eq!(sent.len(), 2);
+    let dunlin::subscriptions::dispatch::Message::Event { event, .. } = &sent[1].message else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(event.kind(), "incident_opened");
+
+    let unsubscribe = subs::unsubscribe_path(&sent[1]);
+    let (status, _, body) = send(app.clone(), get(&unsubscribe)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&format!("action=\"{unsubscribe}\"")),
+        "{body}"
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(&unsubscribe)
+        .header(HOST, "localhost")
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("List-Unsubscribe=One-Click"))
+        .unwrap();
+    let (status, _, body) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Unsubscribed"), "{body}");
+    assert!(dunlin::subscriptions::list(&pool).await.unwrap().is_empty());
+    let (status, _, _) = send(app, get(&unsubscribe)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn expired_confirmation_link() {
+    let (app, state, pool, fake) = subs::setup(false).await;
+    send(
+        app.clone(),
+        subs::subscribe_req("channel=fake&address=a%40b.c&all=1"),
+    )
+    .await;
+    let confirm = subs::confirm_path(&subs::deliver(&state, &fake).await[0]);
+    sqlx::query("UPDATE subscribers SET confirm_expires = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send(app.clone(), get(&confirm)).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(body.contains("Link expired"), "{body}");
+    let (status, _, _) = send(app, post_form(&confirm, "")).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(
+        dunlin::subscriptions::list(&pool).await.unwrap()[0].status,
+        "pending"
+    );
+}
+
+#[tokio::test]
+async fn sign_up_answers_the_same_whoever_is_subscribed() {
+    let (app, state, pool, fake) = subs::setup(false).await;
+    let body = "channel=fake&address=a%40b.c&all=1";
+    let (_, _, first) = send(app.clone(), subs::subscribe_req(body)).await;
+    // Pending, within the resend window.
+    let (_, _, again) = send(app.clone(), subs::subscribe_req(body)).await;
+    // Active.
+    let confirm = subs::confirm_path(&subs::deliver(&state, &fake).await[0]);
+    send(app.clone(), post_form(&confirm, "")).await;
+    let (_, _, active) = send(app.clone(), subs::subscribe_req(body)).await;
+    // A bot filling the honeypot.
+    let (status, _, bot) = send(
+        app,
+        subs::subscribe_req("channel=fake&address=bot%40b.c&all=1&website=spam"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first, again);
+    assert_eq!(first, active);
+    assert_eq!(first, bot);
+    let listed = dunlin::subscriptions::list(&pool).await.unwrap();
+    assert_eq!(listed.len(), 1, "the bot was not stored");
+    assert_eq!(
+        subs::deliver(&state, &fake).await.len(),
+        1,
+        "no second confirmation"
+    );
+}
+
+#[tokio::test]
+async fn sign_up_form_errors_and_rate_limit() {
+    let (app, _state, pool, _fake) = subs::setup(false).await;
+    let cases = [
+        (
+            "channel=nope&address=a%40b.c&all=1",
+            "Pick how to get updates.",
+        ),
+        (
+            "channel=fake&address=nobody&all=1",
+            "That does not look like an address.",
+        ),
+        (
+            "channel=fake&address=a%40b.c",
+            "Pick at least one component",
+        ),
+        (
+            "channel=fake&address=a%40b.c&components=gone",
+            "Pick at least one component",
+        ),
+    ];
+    for (body, want) in cases {
+        let (status, _, page) = send(app.clone(), subs::subscribe_req(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(page.contains(want), "{body}: {page}");
+    }
+    // The form keeps what was typed.
+    let (_, _, page) = send(
+        app.clone(),
+        subs::subscribe_req("channel=fake&address=nobody&components=db"),
+    )
+    .await;
+    assert!(page.contains("value=\"nobody\""), "{page}");
+    assert!(page.contains("value=\"db\" checked"), "{page}");
+
+    // Five attempts so far this hour; the sixth is turned away.
+    let (status, _, page) = send(
+        app.clone(),
+        subs::subscribe_req("channel=fake&address=x%40y.z&all=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(page.contains("Too many sign-ups"), "{page}");
+    assert!(dunlin::subscriptions::list(&pool).await.unwrap().is_empty());
+
+    // Without an Origin the form post is refused before anything else.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/subscribe")
+        .header(HOST, "localhost")
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("channel=fake&address=a%40b.c&all=1"))
+        .unwrap();
+    assert_eq!(send(app, req).await.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn protect_read_covers_the_form_but_not_the_links() {
+    let (app, state, pool, fake) = subs::setup(true).await;
+    let (status, headers, _) = send(app.clone(), get("/subscribe")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/login");
+    let (status, _, _) = send(
+        app.clone(),
+        subs::subscribe_req("channel=fake&address=a%40b.c&all=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(dunlin::subscriptions::list(&pool).await.unwrap().is_empty());
+
+    // Someone logged in can sign up; the links then work for anyone.
+    let cookie = login(&app).await;
+    let mut req = subs::subscribe_req("channel=fake&address=a%40b.c&all=1");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    send(app.clone(), req).await;
+    let confirm = subs::confirm_path(&subs::deliver(&state, &fake).await[0]);
+    let (status, _, _) = send(app.clone(), get(&confirm)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(app, post_form(&confirm, "")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn manage_lists_masked_subscribers_and_deletes_them() {
+    let (app, state, pool, fake) = subs::setup(false).await;
+    send(
+        app.clone(),
+        subs::subscribe_req("channel=fake&address=jane%40example.org&all=1&maintenance=1"),
+    )
+    .await;
+    send(
+        app.clone(),
+        subs::subscribe_req("channel=fake&address=bob%40example.org&components=db"),
+    )
+    .await;
+    let confirm = subs::confirm_path(&subs::deliver(&state, &fake).await[0]);
+    send(app.clone(), post_form(&confirm, "")).await;
+
+    let cookie = login(&app).await;
+    let mut req = get("/manage");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (_, _, body) = send(app.clone(), req).await;
+    assert!(body.contains("fake: 1 active, 1 pending"), "{body}");
+    assert!(!body.contains("jane@example.org"), "full address leaked");
+    assert!(body.contains("…"), "{body}");
+    assert!(body.contains("All components · maintenance"), "{body}");
+    assert!(
+        body.contains(">Database<") || body.contains("Database</p>"),
+        "{body}"
+    );
+
+    let id = dunlin::subscriptions::list(&pool).await.unwrap()[0].id;
+    // Deleting needs the session and the CSRF check like any write.
+    let (status, _, _) = send(
+        app.clone(),
+        post_form(&format!("/manage/subscribers/{id}/delete"), ""),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(dunlin::subscriptions::list(&pool).await.unwrap().len(), 2);
+    let mut req = post_form(&format!("/manage/subscribers/{id}/delete"), "");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, headers, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/manage");
+    let left = dunlin::subscriptions::list(&pool).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_ne!(left[0].id, id);
+}
+
+#[tokio::test]
+async fn manual_changes_and_planned_maintenance_are_queued() {
+    let (app, state, pool, _fake) = subs::setup(false).await;
+    let req = dunlin::subscriptions::SignUp {
+        channel: "fake".into(),
+        address: "a@b.c".into(),
+        all_components: true,
+        components: vec![],
+        maintenance: true,
+    };
+    dunlin::subscriptions::sign_up(&pool, &req, 0)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE subscribers SET status = 'active'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM outbox")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = login(&app).await;
+    let post = |uri: &str, body: &str| {
+        let mut req = post_form(uri, body);
+        req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+        req
+    };
+    send(
+        app.clone(),
+        post(
+            "/incidents",
+            "title=Down&component=__all&state=major_outage&message=Looking",
+        ),
+    )
+    .await;
+    let id = db::active_incidents(&pool).await.unwrap()[0].id;
+    send(
+        app.clone(),
+        post(
+            &format!("/incidents/{id}/updates"),
+            "state=identified&message=Found+it",
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        post(
+            &format!("/incidents/{id}/updates"),
+            "state=resolved&message=Fixed",
+        ),
+    )
+    .await;
+    let id2 = {
+        send(
+            app.clone(),
+            post(
+                "/incidents",
+                "title=Again&component=web&state=degraded&message=",
+            ),
+        )
+        .await;
+        db::active_incidents(&pool).await.unwrap()[0].id
+    };
+    send(app.clone(), post(&format!("/incidents/{id2}/resolve"), "")).await;
+    // Starting now is announced by the dispatcher's check, not here.
+    send(
+        app.clone(),
+        post("/maintenance", "component=web&duration_minutes=30&note=now"),
+    )
+    .await;
+    send(
+        app.clone(),
+        post(
+            "/maintenance",
+            "component=web&duration_minutes=30&note=later&starts_in_seconds=3600",
+        ),
+    )
+    .await;
+
+    let rows: Vec<(String, String)> = sqlx::query("SELECT kind, payload FROM outbox ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            use sqlx::Row;
+            let p: serde_json::Value =
+                serde_json::from_str(&r.get::<String, _>("payload")).unwrap();
+            let text = p["message"]
+                .as_str()
+                .or(p["note"].as_str())
+                .unwrap_or("")
+                .to_string();
+            (r.get("kind"), text)
+        })
+        .collect();
+    let want: Vec<(String, String)> = [
+        ("incident_opened", "Looking"),
+        ("incident_updated", "Found it"),
+        ("incident_resolved", "Fixed"),
+        ("incident_opened", "Incident created."),
+        ("incident_resolved", "Resolved by operator."),
+        ("maintenance_scheduled", "later"),
+    ]
+    .iter()
+    .map(|(k, m)| (k.to_string(), m.to_string()))
+    .collect();
+    assert_eq!(rows, want);
+
+    // The dispatcher's check then announces the one that started.
+    dunlin::subscriptions::maintenance_tick(&pool, &state.cfg(), dunlin::now_ts())
+        .await
+        .unwrap();
+    let last: String = {
+        use sqlx::Row;
+        sqlx::query("SELECT kind FROM outbox ORDER BY id DESC")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("kind")
+    };
+    assert_eq!(last, "maintenance_started");
+}
