@@ -21,11 +21,20 @@ use crate::summary;
 use crate::systemd::{configured_units, unit_samples, SystemdSource};
 use crate::web::{self, AppState};
 
+/// How long the config directory has to stay quiet before a reload.
+///
+/// One save is several filesystem events (editors and `sed -i` write a temp
+/// file and rename it, `cat >>` truncates then writes), and inotify reports
+/// each of them; reloading per event parsed the file up to 8 times per edit.
+const RELOAD_QUIET: Duration = Duration::from_millis(300);
+
 /// Actor that keeps the config-reload notification stream alive.
 ///
 /// Besides the config file it watches the theme's logo and custom CSS, so a
 /// stylesheet edit shows up without touching the config. Theme files added
 /// later in a new directory are picked up on the next config edit, not live.
+///
+/// Must be called inside a tokio runtime: the debounce runs as a task.
 pub fn spawn_config_watcher(path: PathBuf, tx: watch::Sender<Arc<Config>>) -> Result<()> {
     // notify reports absolute paths, so a relative `--config dunlin.toml`
     // would never compare equal without canonicalising first.
@@ -44,6 +53,13 @@ pub fn spawn_config_watcher(path: PathBuf, tx: watch::Sender<Arc<Config>>) -> Re
             }
         }
     }
+    let config_rx = tx.subscribe();
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::unbounded_channel();
+    let reload_path = path.clone();
+    tokio::spawn(coalesce_reloads(reload_rx, RELOAD_QUIET, move || {
+        apply_reload(&reload_path, &tx);
+    }));
+
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("config-watch".to_string())
@@ -66,19 +82,11 @@ pub fn spawn_config_watcher(path: PathBuf, tx: watch::Sender<Arc<Config>>) -> Re
             for res in event_rx {
                 match res {
                     Ok(event) => {
-                        let theme: Vec<PathBuf> = tx
-                            .borrow()
-                            .theme_files
-                            .paths
-                            .iter()
-                            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
-                            .collect();
-                        let relevant = event.paths.iter().any(|p| {
-                            let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                            p == path || theme.contains(&p)
-                        });
-                        if relevant {
-                            apply_reload(&path, &tx);
+                        let theme = config_rx.borrow().theme_files.paths.clone();
+                        if touches_watched(&event.paths, &path, &theme)
+                            && reload_tx.send(()).is_err()
+                        {
+                            return;
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "config watch error"),
@@ -87,6 +95,34 @@ pub fn spawn_config_watcher(path: PathBuf, tx: watch::Sender<Arc<Config>>) -> Re
         })
         .context("spawning config watcher")?;
     Ok(())
+}
+
+/// Whether an event concerns the config file or one of the theme files.
+///
+/// Watching the directory rather than the file is what keeps an atomic
+/// replace (temp file renamed over the config) or a `mv` working: the file's
+/// inode changes, but the rename still reports the config path.
+fn touches_watched(event_paths: &[PathBuf], config: &Path, theme: &[PathBuf]) -> bool {
+    let canon = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+    let theme: Vec<PathBuf> = theme.iter().map(canon).collect();
+    event_paths.iter().any(|p| {
+        let p = canon(p);
+        p == config || theme.contains(&p)
+    })
+}
+
+/// Run `reload` once per burst of events, after `quiet` without a new one.
+async fn coalesce_reloads(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<()>,
+    quiet: Duration,
+    mut reload: impl FnMut(),
+) {
+    while events.recv().await.is_some() {
+        // A closed channel mid-burst still gets its reload, so the last
+        // edit before shutdown of the watcher is not silently dropped.
+        while let Ok(Some(())) = tokio::time::timeout(quiet, events.recv()).await {}
+        reload();
+    }
 }
 
 /// Reload a file into the running config, keeping the old one when invalid.
@@ -328,10 +364,30 @@ pub async fn prober_loop(
     let mut docker: Option<Arc<dyn DockerSource>> = None;
     let mut systemd: Option<Arc<dyn SystemdSource>> = None;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    // `run` bootstraps the engine against the startup config, so only later
+    // swaps need reconciling.
+    let mut applied = config_rx.borrow().clone();
     loop {
         ticker.tick().await;
         let cfg = config_rx.borrow().clone();
         let now = crate::now_ts();
+        if !Arc::ptr_eq(&cfg, &applied) {
+            // Nothing probes a removed check again, so its open incident and
+            // machine have to be cleared here or they stay open for good.
+            // On failure `applied` stays put so the next tick retries.
+            match engine
+                .lock()
+                .await
+                .forget_unmonitored(&pool, &cfg, Some(&applied), now)
+                .await
+            {
+                Ok(_) => {
+                    forget_removed_checks(&cfg, &mut last, &mut first_run);
+                    applied = cfg.clone();
+                }
+                Err(e) => tracing::warn!(error = %e, "clearing incidents of removed checks"),
+            }
+        }
         ensure_docker(&cfg, &mut docker);
         ensure_systemd(&cfg, &mut systemd).await;
 
@@ -431,6 +487,18 @@ pub async fn prober_loop(
             }
         }
     }
+}
+
+/// Drop per-check timing of checks no longer in `cfg`. A heartbeat removed and
+/// added back under the same id would otherwise count its first-ping grace
+/// from when it was first seen, long ago, and fail at once.
+fn forget_removed_checks(
+    cfg: &Config,
+    last: &mut std::collections::HashMap<String, i64>,
+    first_run: &mut std::collections::HashMap<String, i64>,
+) {
+    last.retain(|id, _| cfg.check(id).is_some());
+    first_run.retain(|id, _| cfg.check(id).is_some());
 }
 
 pub async fn rollup_loop(pool: Pool, config_rx: watch::Receiver<Arc<Config>>) {
@@ -549,6 +617,91 @@ mod tests {
         std::fs::write(&path, valid2).unwrap();
         apply_reload(&path, &tx);
         assert_eq!(rx.borrow().listen, "127.0.0.1:1234");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_events_reloads_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let quiet = Duration::from_millis(300);
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let counter = reloads.clone();
+        let task = tokio::spawn(coalesce_reloads(rx, quiet, move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // What one `sed -i` looked like on inotify: 8 events within 10 ms.
+        for _ in 0..8 {
+            tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(quiet / 2).await;
+        assert_eq!(reloads.load(Ordering::SeqCst), 0, "still inside the burst");
+        tokio::time::sleep(quiet).await;
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+
+        // A later, separate edit gets its own reload.
+        tx.send(()).unwrap();
+        tokio::time::sleep(quiet * 2).await;
+        assert_eq!(reloads.load(Ordering::SeqCst), 2);
+
+        // Events that keep arriving push the reload back until they stop.
+        for _ in 0..5 {
+            tx.send(()).unwrap();
+            tokio::time::sleep(quiet / 2).await;
+        }
+        assert_eq!(reloads.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(quiet).await;
+        assert_eq!(reloads.load(Ordering::SeqCst), 3);
+
+        drop(tx);
+        task.await.unwrap();
+        assert_eq!(reloads.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn replacing_the_config_file_counts_as_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("dunlin.toml");
+        std::fs::write(&config, "a").unwrap();
+        let theme = vec![dir.path().join("x.css")];
+
+        // Editor / `sed -i` style: the temp file is gone after the rename,
+        // and the event carries both names.
+        let temp = dir.path().join(".dunlin.toml.swp");
+        assert!(touches_watched(
+            &[temp.clone(), config.clone()],
+            &config,
+            &theme
+        ));
+        // `mv other dunlin.toml` from a non-canonical spelling of the dir.
+        let spelled = dir.path().join(".").join("dunlin.toml");
+        assert!(touches_watched(&[spelled], &config, &theme));
+        // Theme file edits count, unrelated files do not.
+        std::fs::write(dir.path().join("x.css"), "body{}").unwrap();
+        assert!(touches_watched(
+            &[dir.path().join("x.css")],
+            &config,
+            &theme
+        ));
+        assert!(!touches_watched(&[temp], &config, &theme));
+    }
+
+    #[test]
+    fn removed_checks_lose_their_timing() {
+        let cfg = Config {
+            checks: vec![test_check()],
+            ..Config::default()
+        };
+        let timing =
+            || std::collections::HashMap::from([("c".to_string(), 1), ("gone".to_string(), 2)]);
+        let (mut last, mut first_run) = (timing(), timing());
+        forget_removed_checks(&cfg, &mut last, &mut first_run);
+        assert_eq!(last.keys().collect::<Vec<_>>(), ["c"]);
+        assert_eq!(first_run.keys().collect::<Vec<_>>(), ["c"]);
     }
 
     #[tokio::test]

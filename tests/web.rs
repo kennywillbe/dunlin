@@ -700,6 +700,44 @@ async fn incident_page_renders_timeline_newest_first() {
 }
 
 #[tokio::test]
+async fn manual_incident_on_a_removed_component_still_renders() {
+    use dunlin::models::{IncidentState, State};
+    let (state, pool) = state(false).await;
+    let id = db::create_incident(
+        &pool,
+        "removed-db",
+        "Database migration",
+        State::PartialOutage,
+        IncidentState::Identified,
+        false,
+        100,
+    )
+    .await
+    .unwrap();
+    db::add_update(&pool, id, 100, IncidentState::Identified, "on it", false)
+        .await
+        .unwrap();
+    let app = app(state);
+    let cookie = login(&app).await;
+
+    // No component row owns it, so the status page only links it from the
+    // detail line; what matters is that nothing errors or goes missing.
+    let (status, _, body) = send(app.clone(), get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&format!("/incidents/{id}")));
+    for uri in ["/incidents", &format!("/incidents/{id}"), "/feed.xml"] {
+        let (status, _, body) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(body.contains("Database migration"), "{uri}");
+    }
+    let mut manage = get("/manage");
+    manage.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, body) = send(app, manage).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Database migration"));
+}
+
+#[tokio::test]
 async fn unknown_page_is_a_designed_404() {
     let (state, _pool) = state(false).await;
     let app = app(state);
