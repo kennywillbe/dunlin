@@ -12,6 +12,8 @@ pub const SESSION_COOKIE: &str = "dunlin_session";
 pub const SESSION_TTL_SECS: i64 = 30 * 86_400;
 const MAX_FAILURES: usize = 5;
 const WINDOW_SECS: i64 = 15 * 60;
+/// Map size at which expired entries of every address are dropped.
+const SWEEP_AT: usize = 1024;
 
 /// Per-IP login failure tracking. Deliberately per-IP: a single attacker can
 /// only lock out their own address, never everyone.
@@ -25,18 +27,39 @@ impl LoginLimiter {
         Self::default()
     }
 
+    /// Read-only for addresses without failures, so a flood of logins from
+    /// many addresses does not leave an entry behind for each of them.
     pub fn is_blocked(&self, ip: &str, now: i64) -> bool {
         let mut map = self.failures.lock().unwrap();
-        let entry = map.entry(ip.to_string()).or_default();
+        let Some(entry) = map.get_mut(ip) else {
+            return false;
+        };
         entry.retain(|t| now - *t < WINDOW_SECS);
-        entry.len() >= MAX_FAILURES
+        let blocked = entry.len() >= MAX_FAILURES;
+        if entry.is_empty() {
+            map.remove(ip);
+        }
+        blocked
     }
 
     pub fn record_failure(&self, ip: &str, now: i64) {
         let mut map = self.failures.lock().unwrap();
+        // Entries are otherwise only trimmed when their own address returns;
+        // sweep them all once the map gets large.
+        if map.len() >= SWEEP_AT {
+            map.retain(|_, times| {
+                times.retain(|t| now - *t < WINDOW_SECS);
+                !times.is_empty()
+            });
+        }
         let entry = map.entry(ip.to_string()).or_default();
         entry.retain(|t| now - *t < WINDOW_SECS);
         entry.push(now);
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.failures.lock().unwrap().len()
     }
 
     pub fn record_success(&self, ip: &str) {
@@ -138,6 +161,22 @@ mod tests {
         l.record_failure("1.2.3.4", 1000);
         l.record_success("1.2.3.4");
         assert!(!l.is_blocked("1.2.3.4", 1000));
+    }
+
+    #[test]
+    fn limiter_forgets_addresses_whose_failures_expired() {
+        let l = LoginLimiter::new();
+        // Checking alone keeps nothing.
+        assert!(!l.is_blocked("1.1.1.1", 0));
+        assert_eq!(l.tracked(), 0);
+
+        for i in 0..SWEEP_AT {
+            l.record_failure(&format!("10.0.{}.{}", i / 256, i % 256), 0);
+        }
+        assert_eq!(l.tracked(), SWEEP_AT);
+        // Past the window, the next failure sweeps the stale ones.
+        l.record_failure("9.9.9.9", WINDOW_SECS + 1);
+        assert_eq!(l.tracked(), 1);
     }
 
     #[test]
