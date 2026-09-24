@@ -5,6 +5,8 @@
 # logged and the running configuration is kept.
 
 # Address the web UI and API listen on. Required.
+# In Docker use "0.0.0.0:8080": inside a container 127.0.0.1 is the container
+# itself, so the published port would reach nothing.
 listen = "127.0.0.1:8080"
 
 # Directory for the SQLite database. The DB is created as <data_dir>/dunlin.db.
@@ -174,6 +176,8 @@ restart_limit = 5
 id = "root-disk"
 name = "Root disk"
 type = "disk"
+# A path as dunlin sees it. In Docker, "/" is the container's own filesystem:
+# mount the host's (e.g. "/:/host/root:ro") and use mount = "/host/root".
 mount = "/"
 # Warn at or above warn, fail at or above critical. Percentages.
 warn = 80.0
