@@ -63,9 +63,14 @@ and the system D-Bus socket are optional read-only mounts, and the database
 lives in a named volume.
 
 ```sh
-cp dunlin.example.toml dunlin.toml     # set proc_root = "/host/proc"
+cp dunlin.example.toml dunlin.toml     # set proc_root = "/host/proc" and listen = "0.0.0.0:8080"
 docker compose -f docker-compose.example.yml up -d
 ```
+
+Inside the container, `listen` has to be `0.0.0.0:8080` for the published port
+to reach dunlin, and a disk check's `mount` is a path in the container: mount
+the host filesystem you want measured (the compose file has a commented line
+for `/`) and point `mount` at it.
 
 ## Configuration
 
