@@ -145,6 +145,12 @@ Authorization = "Bearer REPLACE"
 # Visitors' own webhook URLs: Slack, Discord or any https JSON endpoint.
 # [subscriptions.webhook]
 # enabled = true
+#
+# A Telegram bot visitors start from a link. Use a bot of its own.
+# [subscriptions.telegram]
+# enabled = true
+# token = "123456:REPLACE"
+# username = "acme_status_bot"    # optional; asked of Telegram if left out
 
 # Groups organise components on the status page.
 [[groups]]

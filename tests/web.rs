@@ -2351,3 +2351,45 @@ async fn email_shows_on_the_form_when_configured() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn telegram_sign_up_gives_a_bot_link() {
+    use dunlin::subscriptions::telegram::{BotApi, TelegramChannel};
+    let (state, pool) = state_from(subs::subs_config(true, false)).await;
+    // The bot's name is configured, so nothing is asked of Telegram.
+    let api = BotApi::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9".into(),
+        "1:x".into(),
+    );
+    state
+        .channels
+        .replace(vec![Arc::new(TelegramChannel::with_api(
+            api,
+            Some("acme_status_bot".into()),
+        ))]);
+    let app = app(state);
+    let (_, _, page) = send(app.clone(), get("/subscribe")).await;
+    assert!(page.contains("no address needed"), "{page}");
+
+    let (status, _, page) = send(
+        app,
+        subs::subscribe_req("channel=telegram&address=&components=db&maintenance=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.contains("Finish in Telegram"), "{page}");
+    let start = page
+        .find("https://t.me/acme_status_bot?start=")
+        .expect(&page);
+    let token: String = page[start + 35..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    assert_eq!(token.len(), 64, "{page}");
+    let listed = dunlin::subscriptions::list(&pool).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, "pending");
+    assert_eq!(listed[0].components, ["db"]);
+    assert!(listed[0].address.starts_with("pending:"));
+}

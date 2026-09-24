@@ -275,6 +275,29 @@ does not go through an HTTP proxy. Replies other than 2xx count as failures;
 404 and 410 (a deleted webhook) give that message up at once, and 429 is
 retried without counting.
 
+### Telegram
+
+```toml
+[subscriptions.telegram]
+enabled = true
+token = "123456:ABC..."        # from @BotFather
+username = "acme_status_bot"   # optional; asked of Telegram when left out
+```
+
+1. In Telegram, message @BotFather, send `/newbot` and pick a name.
+2. Copy the token it gives you into `token`.
+3. Give subscriptions a bot of their own: the bot reads its messages by long
+   polling, and a second program polling it, or a webhook set on it, takes
+   those messages away (dunlin logs a 409 "Conflict" when that happens and
+   does not remove the webhook for you). The operator `[[notifiers]]` bot only
+   sends, so it may share the token.
+
+Visitors who pick Telegram get a `t.me` link instead of a confirmation
+message; pressing Start there subscribes that chat, groups included. `/stop`
+unsubscribes it. Messages are plain Telegram text with a link to the
+incident and to unsubscribe. A chat that blocks the bot, a deactivated
+account or a chat that no longer exists is removed on the next message.
+
 #### Quarantine
 
 A subscriber whose webhook fails 10 times within an hour, or whose mail

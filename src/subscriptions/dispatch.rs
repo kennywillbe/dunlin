@@ -100,6 +100,35 @@ impl std::fmt::Display for CountedFailure {
 
 impl std::error::Error for CountedFailure {}
 
+/// The address is gone for good (a Telegram user blocked the bot, say):
+/// the dispatcher deletes the subscriber and everything queued for it.
+#[derive(Debug)]
+pub struct SubscriberGone(pub String);
+
+impl std::fmt::Display for SubscriberGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SubscriberGone {}
+
+/// Rate limited, with the wait the service asked for. Retried no sooner,
+/// and not counted toward quarantine.
+#[derive(Debug)]
+pub struct RetryAfter {
+    pub secs: i64,
+    pub message: String,
+}
+
+impl std::fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (retry after {} s)", self.message, self.secs)
+    }
+}
+
+impl std::error::Error for RetryAfter {}
+
 /// Counted failures that quarantine a subscriber, and the window they are
 /// counted in. The window starts at the first failure and a success clears
 /// it, so a flaky endpoint that recovers starts over.
@@ -164,6 +193,16 @@ pub trait SubscriberChannel: Send + Sync {
     /// Check and normalise what the visitor typed. The error is shown to
     /// them as is.
     fn normalize_address(&self, input: &str) -> std::result::Result<String, String>;
+    /// False for a channel whose address arrives later, by the subscriber
+    /// following a link (Telegram learns the chat when they press Start).
+    fn needs_address(&self) -> bool {
+        true
+    }
+    /// For such a channel: the link a sign-up's confirm token is appended
+    /// to, or `None` while it cannot be offered.
+    async fn start_link(&self) -> Option<String> {
+        None
+    }
     fn pacing(&self) -> Pacing {
         Pacing::default()
     }
@@ -212,6 +251,12 @@ pub fn build_channels(cfg: &Config) -> Vec<Arc<dyn SubscriberChannel>> {
         match super::email::EmailChannel::new(email) {
             Ok(c) => out.push(Arc::new(c)),
             Err(e) => tracing::warn!(error = %e, "email subscriptions unavailable"),
+        }
+    }
+    if let Some(t) = cfg.subscriptions.telegram.as_ref().filter(|t| t.enabled) {
+        match super::telegram::TelegramChannel::new(t) {
+            Ok(c) => out.push(Arc::new(c)),
+            Err(e) => tracing::warn!(error = %e, "telegram subscriptions unavailable"),
         }
     }
     if cfg
@@ -287,6 +332,7 @@ pub struct DispatchStats {
     pub retried: usize,
     pub given_up: usize,
     pub quarantined: usize,
+    pub removed: usize,
 }
 
 /// Send every due outbox row once. Rows for channels that are not switched
@@ -406,6 +452,15 @@ pub async fn dispatch_due(
             Err(e) => {
                 let error: String = format!("{e:#}").chars().take(500).collect();
                 tracing::warn!(outbox = id, channel = %channel_name, attempts, error = %error, "subscriber message failed");
+                if e.downcast_ref::<SubscriberGone>().is_some() {
+                    sqlx::query("DELETE FROM subscribers WHERE id = ?")
+                        .bind(sid)
+                        .execute(pool)
+                        .await?;
+                    tracing::info!(subscriber = sid, channel = %channel_name, "subscriber removed: address gone");
+                    stats.removed += 1;
+                    continue;
+                }
                 let permanent = e.downcast_ref::<PermanentFailure>().is_some();
                 if (permanent || e.downcast_ref::<CountedFailure>().is_some())
                     && count_failure(pool, sid, now).await?
@@ -426,7 +481,10 @@ pub async fn dispatch_due(
                     sqlx::query(
                         "UPDATE outbox SET next_attempt_at = ?, attempts = ?, last_error = ? WHERE id = ?",
                     )
-                    .bind(now + retry_delay(attempts))
+                    .bind(
+                        now + retry_delay(attempts)
+                            .max(e.downcast_ref::<RetryAfter>().map_or(0, |r| r.secs)),
+                    )
                     .bind(attempts)
                     .bind(&error)
                     .bind(id)

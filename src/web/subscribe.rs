@@ -104,6 +104,7 @@ fn notice(
         heading: heading.to_string(),
         paragraphs: paragraphs.iter().map(|p| p.to_string()).collect(),
         action,
+        link: None,
     })
 }
 
@@ -188,9 +189,13 @@ pub(super) async fn subscribe_submit(
     let Some(channel) = state.channels.get(&form.channel) else {
         return invalid("Pick how to get updates.");
     };
-    let address = match channel.normalize_address(&form.address) {
-        Ok(a) => a,
-        Err(e) => return invalid(&e),
+    let address = if channel.needs_address() {
+        match channel.normalize_address(&form.address) {
+            Ok(a) => a,
+            Err(e) => return invalid(&e),
+        }
+    } else {
+        String::new()
     };
     let components: Vec<String> = form
         .components
@@ -208,6 +213,36 @@ pub(super) async fn subscribe_submit(
         components,
         maintenance: form.maintenance,
     };
+    if !channel.needs_address() {
+        // The address comes from following the link, so the page gives it
+        // out rather than a message. Checked before the row exists, so a
+        // bot Telegram cannot reach leaves nothing behind.
+        let Some(link) = channel.start_link().await else {
+            return invalid(&format!(
+                "{} is not available right now. Try again in a minute.",
+                channel.label()
+            ));
+        };
+        let token = match subscriptions::sign_up_by_link(&state.pool, &req, now).await {
+            Ok(t) => t,
+            Err(e) => return internal(&state, e),
+        };
+        return render(&NoticeTemplate {
+            site: SiteView::new(&cfg, logged_in, "subscribe"),
+            side: side(),
+            heading: format!("Finish in {}", channel.label()),
+            paragraphs: vec![
+                "Open the link and press Start. That chat then gets the updates you picked."
+                    .to_string(),
+                "The link works for 24 hours.".to_string(),
+            ],
+            action: None,
+            link: Some(NoticeAction {
+                url: format!("{link}{token}"),
+                label: format!("Open {}", channel.label()),
+            }),
+        });
+    }
     if let Err(e) = subscriptions::sign_up(&state.pool, &req, now).await {
         return internal(&state, e);
     }

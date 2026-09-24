@@ -443,6 +443,8 @@ pub struct NoticeTemplate {
     pub heading: String,
     pub paragraphs: Vec<String>,
     pub action: Option<NoticeAction>,
+    /// A button that is a plain link, such as into Telegram.
+    pub link: Option<NoticeAction>,
 }
 
 #[derive(Template)]

@@ -183,6 +183,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         config_rx.clone(),
         state.channels.clone(),
     ));
+    tokio::spawn(crate::subscriptions::telegram::poll_loop(
+        pool.clone(),
+        config_rx.clone(),
+    ));
     tokio::spawn(crate::subscriptions::dispatch::channel_reload_loop(
         config_rx.clone(),
         state.channels.clone(),

@@ -304,6 +304,24 @@ pub struct SubscriptionsConfig {
     pub email: Option<EmailConfig>,
     #[serde(default)]
     pub webhook: Option<SubscriberWebhookConfig>,
+    #[serde(default)]
+    pub telegram: Option<SubscriberTelegramConfig>,
+}
+
+/// `[subscriptions.telegram]`: a bot visitors start from a link, which then
+/// sends them updates. Best a bot of its own: another program polling the
+/// same bot takes its updates away.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriberTelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// From @BotFather, e.g. `123456:ABC-DEF…`. A secret.
+    pub token: String,
+    /// The bot's @name without the @, for `t.me` links. Asked of Telegram
+    /// (`getMe`) when left out.
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 /// `[subscriptions.webhook]`: visitors give an https URL (Slack, Discord or
@@ -843,6 +861,24 @@ pub fn validate(cfg: &Config) -> Result<()> {
         }
     }
 
+    if let Some(t) = &cfg.subscriptions.telegram {
+        let token_ok = t.token.split_once(':').is_some_and(|(id, secret)| {
+            !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && !secret.is_empty()
+        });
+        if !token_ok {
+            errs.push("subscriptions.telegram.token must be a bot token such as \"123456:ABC…\" from @BotFather".to_string());
+        }
+        if let Some(u) = &t.username {
+            let ok = (5..=32).contains(&u.len())
+                && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !ok {
+                errs.push(format!(
+                    "subscriptions.telegram.username {u:?} must be the bot's name without @, such as \"acme_status_bot\""
+                ));
+            }
+        }
+    }
+
     let mut key_names = HashSet::new();
     for k in &cfg.api_keys {
         if k.name.trim().is_empty() {
@@ -1233,6 +1269,46 @@ user = "me"
                 .enabled
         );
         assert!(parse_str(&with("url = \"x\"")).is_err());
+    }
+
+    #[test]
+    fn subscriber_telegram_config() {
+        let with = |t: &str| {
+            format!(
+                "public_url = \"https://status.example.org\"\n{}\n[subscriptions]\nenabled = true\n[subscriptions.telegram]\n{t}\n",
+                base_with_real_hash()
+            )
+        };
+        let t = parse_str(&with(
+            "enabled = true\ntoken = \"123456:ABC-def_1\"\nusername = \"acme_status_bot\"",
+        ))
+        .unwrap()
+        .subscriptions
+        .telegram
+        .unwrap();
+        assert!(t.enabled);
+        assert_eq!(t.username.as_deref(), Some("acme_status_bot"));
+        assert!(parse_str(&with("token = \"1:x\""))
+            .unwrap()
+            .subscriptions
+            .telegram
+            .unwrap()
+            .username
+            .is_none());
+        for (t, want) in [
+            ("token = \"nocolon\"", "telegram.token"),
+            ("token = \"abc:def\"", "telegram.token"),
+            ("token = \"123:\"", "telegram.token"),
+            (
+                "token = \"1:x\"\nusername = \"@acme_bot\"",
+                "telegram.username",
+            ),
+            ("token = \"1:x\"\nusername = \"abc\"", "telegram.username"),
+        ] {
+            let err = parse_str(&with(t)).unwrap_err().to_string();
+            assert!(err.contains(want), "{t}: {err}");
+        }
+        assert!(parse_str(&with("enabled = true")).is_err());
     }
 
     #[test]

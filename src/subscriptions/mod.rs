@@ -9,6 +9,7 @@
 
 pub mod dispatch;
 pub mod email;
+pub mod telegram;
 pub mod webhook;
 
 use anyhow::{Context, Result};
@@ -560,6 +561,55 @@ pub async fn sign_up(pool: &Pool, req: &SignUp, now: i64) -> Result<()> {
     Ok(())
 }
 
+/// Addresses of sign-ups whose address is not known yet start with this;
+/// the random rest keeps them apart under the (channel, address) key.
+pub const PENDING_ADDRESS: &str = "pending:";
+
+/// Record a sign-up for a channel that learns the address from the
+/// subscriber following a link (Telegram). Returns the confirm token for
+/// that link. Every sign-up gets a row of its own, since nothing ties it to
+/// an earlier one yet; unused rows are pruned with other stale sign-ups.
+pub async fn sign_up_by_link(pool: &Pool, req: &SignUp, now: i64) -> Result<String> {
+    let mut tx = pool.begin().await?;
+    let key = signing_key(&mut tx).await?;
+    let expires = now + CONFIRM_TTL_SECS;
+    let id: i64 = sqlx::query(
+        "INSERT INTO subscribers
+           (channel, address, all_components, maintenance, status, unsub_hash, created_at, confirm_expires)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?) RETURNING id",
+    )
+    .bind(&req.channel)
+    .bind(format!("{PENDING_ADDRESS}{}", auth::random_token()))
+    .bind(req.all_components as i64)
+    .bind(req.maintenance as i64)
+    .bind(auth::random_token())
+    .bind(now)
+    .bind(expires)
+    .fetch_one(&mut *tx)
+    .await?
+    .get("id");
+    let token = confirm_token(&key, id, expires);
+    sqlx::query("UPDATE subscribers SET unsub_hash = ?, confirm_hash = ? WHERE id = ?")
+        .bind(auth::token_hash(&unsubscribe_token(&key, id, now)))
+        .bind(auth::token_hash(&token))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if !req.all_components {
+        for c in &req.components {
+            sqlx::query(
+                "INSERT OR IGNORE INTO subscriber_components (subscriber_id, component_id) VALUES (?, ?)",
+            )
+            .bind(id)
+            .bind(c)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(token)
+}
+
 /// What a confirmation link points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmLink {
@@ -681,6 +731,9 @@ pub async fn delete(pool: &Pool, id: i64) -> Result<bool> {
 /// Enough of an address for an operator to tell subscribers apart without
 /// the /manage page listing everyone's full address.
 pub fn mask(channel: &str, address: &str) -> String {
+    if address.starts_with(PENDING_ADDRESS) {
+        return "not linked yet".to_string();
+    }
     match channel {
         "email" => match address.split_once('@') {
             Some((local, domain)) => {
