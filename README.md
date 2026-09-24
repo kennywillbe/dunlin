@@ -121,8 +121,10 @@ Create a heartbeat check with a `token`, then ping it when a job runs:
 curl -fsS -X POST https://dunlin.example.org/hb/<token>
 ```
 
-The check fails when no ping arrives within `period + grace`. Tokens are compared
-in constant time.
+The check fails when no ping arrives within `period + grace`. A check that has
+never been pinged gets the same time from when dunlin starts watching it, so a
+new nightly job is not reported down before its first night. Tokens are
+compared in constant time.
 
 ## Webhook payload
 

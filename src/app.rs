@@ -263,6 +263,8 @@ struct ProbeEnv<'a> {
     http: &'a reqwest::Client,
     containers: Option<&'a [crate::docker::ContainerStat]>,
     units: Option<&'a [crate::systemd::UnitStat]>,
+    /// When this process first ran each check, by id.
+    first_run: &'a std::collections::HashMap<String, i64>,
     now: i64,
 }
 
@@ -289,7 +291,8 @@ async fn evaluate(check: &CheckConfig, env: &ProbeEnv<'_>) -> Option<ProbeOutcom
         CheckType::Systemd => prober::probe_systemd(check, env.units?),
         CheckType::Heartbeat => {
             let last = db::last_ping(env.pool, &check.id).await.ok().flatten();
-            prober::probe_heartbeat(check, last, env.now)
+            let since = env.first_run.get(&check.id).copied().unwrap_or(env.now);
+            prober::probe_heartbeat(check, last, since, env.now)
         }
     })
 }
@@ -321,6 +324,7 @@ pub async fn prober_loop(
     http: reqwest::Client,
 ) {
     let mut last: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut first_run: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut docker: Option<Arc<dyn DockerSource>> = None;
     let mut systemd: Option<Arc<dyn SystemdSource>> = None;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -342,6 +346,7 @@ pub async fn prober_loop(
         }
         for c in &due {
             last.insert(c.id.clone(), now);
+            first_run.entry(c.id.clone()).or_insert(now);
         }
 
         let needs_docker = due.iter().any(|c| c.kind == CheckType::Docker) && docker.is_some();
@@ -381,6 +386,7 @@ pub async fn prober_loop(
                 http: &http,
                 containers: containers.as_deref(),
                 units: unit_states.as_deref(),
+                first_run: &first_run,
                 now,
             };
             // A Docker/systemd check whose source is off or did not answer is
@@ -594,11 +600,13 @@ mod tests {
     async fn source_checks_without_data_are_skipped_not_passed() {
         let pool = crate::db::connect_memory().await.unwrap();
         let http = prober::http_client().unwrap();
+        let first_run = Default::default();
         let env = ProbeEnv {
             pool: &pool,
             http: &http,
             containers: None,
             units: None,
+            first_run: &first_run,
             now: 0,
         };
         let docker = CheckConfig {
