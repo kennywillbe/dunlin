@@ -2329,3 +2329,25 @@ async fn manual_changes_and_planned_maintenance_are_queued() {
     };
     assert_eq!(last, "maintenance_started");
 }
+
+#[tokio::test]
+async fn email_shows_on_the_form_when_configured() {
+    let toml = format!(
+        "public_url = \"https://status.example.org\"\n{}",
+        config_toml(
+            false,
+            "[subscriptions]\nenabled = true\n[subscriptions.email]\nenabled = true\nhost = \"smtp.example.org\"\nfrom = \"Status <status@example.org>\"\n"
+        )
+    );
+    let cfg = Arc::new(config::parse_str(&toml).unwrap());
+    let (state, _pool) = state_from(cfg.clone()).await;
+    state
+        .channels
+        .replace(dunlin::subscriptions::dispatch::build_channels(&cfg));
+    let (_, _, body) = send(app(state), get("/subscribe")).await;
+    assert!(body.contains("value=\"email\" checked"), "{body}");
+    assert!(
+        body.contains("Email <span class=\"soft\">— your email address</span>"),
+        "{body}"
+    );
+}

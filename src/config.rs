@@ -300,6 +300,49 @@ pub enum NotifierConfig {
 pub struct SubscriptionsConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
+}
+
+/// How the SMTP connection is encrypted. There is no plaintext option: the
+/// login and every subscriber's address would cross the network readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpTls {
+    /// Plain connection upgraded with STARTTLS, usually port 587.
+    #[default]
+    Starttls,
+    /// TLS from the first byte, usually port 465.
+    Implicit,
+}
+
+/// `[subscriptions.email]`: the SMTP server subscriber mail goes through.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub host: String,
+    /// Defaults by `tls`: 587 for STARTTLS, 465 for implicit TLS.
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub tls: SmtpTls,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Sender, e.g. `Status <status@example.org>`.
+    pub from: String,
+}
+
+impl EmailConfig {
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(match self.tls {
+            SmtpTls::Starttls => 587,
+            SmtpTls::Implicit => 465,
+        })
+    }
 }
 
 /// `[[api_keys]]`: read access for scripts, dashboards and scrapers.
@@ -769,6 +812,26 @@ pub fn validate(cfg: &Config) -> Result<()> {
         );
     }
 
+    if let Some(e) = &cfg.subscriptions.email {
+        if e.host.trim().is_empty() {
+            errs.push("subscriptions.email.host must not be empty".to_string());
+        }
+        if e.from.parse::<lettre::message::Mailbox>().is_err() {
+            errs.push(format!(
+                "subscriptions.email.from {:?} is not an address such as \"Status <status@example.org>\"",
+                e.from
+            ));
+        }
+        if e.username.is_some() != e.password.is_some() {
+            errs.push(
+                "subscriptions.email needs both username and password, or neither".to_string(),
+            );
+        }
+        if e.port == Some(0) {
+            errs.push("subscriptions.email.port must not be 0".to_string());
+        }
+    }
+
     let mut key_names = HashSet::new();
     for k in &cfg.api_keys {
         if k.name.trim().is_empty() {
@@ -1079,6 +1142,65 @@ user = "me"
         assert!(parse_str(&with_url).unwrap().subscriptions.enabled);
         let bogus = format!("{}\n[subscriptions]\nbogus = 1\n", base_with_real_hash());
         assert!(parse_str(&bogus).is_err());
+    }
+
+    #[test]
+    fn email_channel_config() {
+        let with = |email: &str| {
+            format!(
+                "public_url = \"https://status.example.org\"\n{}\n[subscriptions]\nenabled = true\n[subscriptions.email]\n{email}\n",
+                base_with_real_hash()
+            )
+        };
+        let cfg = parse_str(&with(
+            "enabled = true\nhost = \"smtp.example.org\"\nfrom = \"Status <status@example.org>\"",
+        ))
+        .unwrap();
+        let e = cfg.subscriptions.email.unwrap();
+        assert!(e.enabled);
+        assert_eq!((e.tls, e.port()), (SmtpTls::Starttls, 587));
+        let e = parse_str(&with(
+            "host = \"h\"\nfrom = \"s@example.org\"\ntls = \"implicit\"",
+        ))
+        .unwrap()
+        .subscriptions
+        .email
+        .unwrap();
+        assert_eq!(
+            (e.tls, e.port(), e.enabled),
+            (SmtpTls::Implicit, 465, false)
+        );
+        let e = parse_str(&with("host = \"h\"\nfrom = \"s@example.org\"\nport = 2525"))
+            .unwrap()
+            .subscriptions
+            .email
+            .unwrap();
+        assert_eq!(e.port(), 2525);
+
+        let cases = [
+            ("host = \" \"\nfrom = \"s@example.org\"", "email.host"),
+            ("host = \"h\"\nfrom = \"not an address\"", "email.from"),
+            (
+                "host = \"h\"\nfrom = \"s@example.org\"\nusername = \"u\"",
+                "both username and password",
+            ),
+            (
+                "host = \"h\"\nfrom = \"s@example.org\"\nport = 0",
+                "port must not be 0",
+            ),
+        ];
+        for (email, want) in cases {
+            let err = parse_str(&with(email)).unwrap_err().to_string();
+            assert!(err.contains(want), "{email}: {err}");
+        }
+        // Unknown TLS modes and keys are refused when parsing.
+        assert!(parse_str(&with(
+            "host = \"h\"\nfrom = \"s@example.org\"\ntls = \"none\""
+        ))
+        .is_err());
+        assert!(parse_str(&with("host = \"h\"\nfrom = \"s@example.org\"\nbogus = 1")).is_err());
+        // A missing host or sender is a parse error too.
+        assert!(parse_str(&with("from = \"s@example.org\"")).is_err());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! each token's SHA-256 for lookup.
 
 pub mod dispatch;
+pub mod email;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

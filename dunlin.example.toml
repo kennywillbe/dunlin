@@ -131,6 +131,16 @@ Authorization = "Bearer REPLACE"
 # Needs public_url; each channel gets its own [subscriptions.<channel>] table.
 # [subscriptions]
 # enabled = false
+#
+# Email to subscribers, through your SMTP server.
+# [subscriptions.email]
+# enabled = true
+# host = "smtp.example.org"
+# port = 587                      # default: 587 for starttls, 465 for implicit
+# tls = "starttls"                # or "implicit"
+# username = "status@example.org" # optional, with password
+# password = "REPLACE"
+# from = "Status <status@example.org>"
 
 # Groups organise components on the status page.
 [[groups]]

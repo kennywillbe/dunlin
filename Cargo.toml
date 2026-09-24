@@ -29,6 +29,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 futures-util = "0.3"
 hex = "0.4"
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "pool", "hostname", "builder", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 notify = "8"
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }

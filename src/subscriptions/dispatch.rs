@@ -66,8 +66,24 @@ pub struct Delivery {
     pub address: String,
     /// The status page's title, for greetings and subjects.
     pub site_title: String,
+    /// The configured zone, for writing times the way the page does.
+    pub timezone: chrono_tz::Tz,
     pub message: Message,
 }
+
+/// A send that can never work for this address (the mailbox does not
+/// exist, say). The dispatcher gives the message up at once instead of
+/// retrying it for an hour.
+#[derive(Debug)]
+pub struct PermanentFailure(pub String);
+
+impl std::fmt::Display for PermanentFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PermanentFailure {}
 
 #[async_trait]
 pub trait SubscriberChannel: Send + Sync {
@@ -117,10 +133,39 @@ impl Channels {
     }
 }
 
-/// Channels built from the config. None exist yet; each lands with its own
-/// `[subscriptions.<name>]` table.
-pub fn build_channels(_cfg: &Config) -> Vec<Arc<dyn SubscriberChannel>> {
-    Vec::new()
+/// Channels switched on in the config. One that cannot be built is left
+/// out and logged; its queued messages wait for a config that works.
+pub fn build_channels(cfg: &Config) -> Vec<Arc<dyn SubscriberChannel>> {
+    let mut out: Vec<Arc<dyn SubscriberChannel>> = Vec::new();
+    if !cfg.subscriptions.enabled {
+        return out;
+    }
+    if let Some(email) = cfg.subscriptions.email.as_ref().filter(|e| e.enabled) {
+        match super::email::EmailChannel::new(email) {
+            Ok(c) => out.push(Arc::new(c)),
+            Err(e) => tracing::warn!(error = %e, "email subscriptions unavailable"),
+        }
+    }
+    out
+}
+
+/// Rebuild the channels when `[subscriptions]` changes, so a new SMTP
+/// server or password applies without a restart. `built_from` is what
+/// `channels` was made from.
+pub async fn channel_reload_loop(
+    mut config_rx: watch::Receiver<Arc<Config>>,
+    channels: Arc<Channels>,
+    built_from: crate::config::SubscriptionsConfig,
+) {
+    let mut current = built_from;
+    while config_rx.changed().await.is_ok() {
+        let cfg = config_rx.borrow_and_update().clone();
+        if cfg.subscriptions != current {
+            channels.replace(build_channels(&cfg));
+            current = cfg.subscriptions.clone();
+            tracing::info!("subscription channels reloaded");
+        }
+    }
 }
 
 /// When each channel and each address was last sent to, for `Pacing`.
@@ -251,6 +296,7 @@ pub async fn dispatch_due(
         let delivery = Delivery {
             address: address.clone(),
             site_title: cfg.theme.title.trim().to_string(),
+            timezone: cfg.tz(),
             message,
         };
         let result = match tokio::time::timeout(SEND_LIMIT, channel.send(&delivery)).await {
@@ -278,7 +324,8 @@ pub async fn dispatch_due(
             Err(e) => {
                 let error: String = format!("{e:#}").chars().take(500).collect();
                 tracing::warn!(outbox = id, channel = %channel_name, attempts, error = %error, "subscriber message failed");
-                if attempts >= MAX_ATTEMPTS {
+                let permanent = e.downcast_ref::<PermanentFailure>().is_some();
+                if permanent || attempts >= MAX_ATTEMPTS {
                     sqlx::query("UPDATE outbox SET failed_at = ?, attempts = ?, last_error = ? WHERE id = ?")
                         .bind(now)
                         .bind(attempts)

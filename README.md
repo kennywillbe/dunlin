@@ -209,6 +209,29 @@ only logged-in visitors can sign up, but confirmation and unsubscribe links
 work for anyone. `/manage` lists subscribers with their addresses shortened
 and can remove them.
 
+### Email
+
+```toml
+[subscriptions.email]
+enabled = true
+host = "smtp.example.org"
+port = 587                    # default: 587 for starttls, 465 for implicit
+tls = "starttls"              # or "implicit"
+username = "status@example.org"
+password = "..."
+from = "Acme Status <status@example.org>"
+```
+
+Mail is plain text, a few per second at most. Each one has an unsubscribe
+link and the `List-Unsubscribe` / `List-Unsubscribe-Post` headers, so mail
+clients offer one-click unsubscribe. A mailbox the server reports as unknown
+(550, 551, 553) is not retried; other failures, a wrong password included,
+are retried with the rest of the queue. Changes to this table apply on reload.
+
+Whether the mail reaches inboxes depends on the sending domain: set up SPF,
+DKIM and DMARC for the `from` domain with your mail provider. dunlin only
+hands the mail to your SMTP server and cannot do this for you.
+
 ## Badges
 
 Each component has badges for READMEs and other dashboards, showing the same
