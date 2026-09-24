@@ -108,16 +108,22 @@ pub struct AlertInput<'a> {
 pub struct AlertEngine {
     machines: HashMap<String, CheckMachine>,
     notifiers: Arc<MultiNotifier>,
-    base_url: Option<String>,
+    /// `public_url` from the config; notifications link to the incident.
+    public_url: Option<String>,
 }
 
 impl AlertEngine {
-    pub fn new(notifiers: Arc<MultiNotifier>, base_url: Option<String>) -> Self {
+    pub fn new(notifiers: Arc<MultiNotifier>, public_url: Option<String>) -> Self {
         Self {
             machines: HashMap::new(),
             notifiers,
-            base_url,
+            public_url,
         }
+    }
+
+    /// Follow a reloaded `public_url`.
+    pub fn set_public_url(&mut self, public_url: Option<String>) {
+        self.public_url = public_url;
     }
 
     pub fn machines(&self) -> &HashMap<String, CheckMachine> {
@@ -254,10 +260,8 @@ impl AlertEngine {
     }
 
     async fn notify(&self, mut n: Notification) {
-        if let Some(base) = &self.base_url {
-            if let Some(id) = n.incident_id {
-                n.message = format!("{}\n{}#/incidents/{}", n.message, base, id);
-            }
+        if let (Some(base), Some(id)) = (&self.public_url, n.incident_id) {
+            n.message = format!("{}\n{}", n.message, incident_url(base, id));
         }
         self.notifiers.send(&n).await;
     }
@@ -461,6 +465,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notifications_link_to_the_incident_under_public_url() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let multi = MultiNotifier::new(vec![rec.clone()]);
+        let mut engine = AlertEngine::new(
+            Arc::new(multi),
+            Some("https://status.example.org/".to_string()),
+        );
+        let c = check();
+        for t in 0..3 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let id = db::active_incidents(&pool).await.unwrap()[0].id;
+        let sent = rec.messages();
+        assert_eq!(
+            sent[0].message,
+            format!("boom\nhttps://status.example.org/incidents/{id}")
+        );
+    }
+
+    #[tokio::test]
     async fn operator_resolve_resets_the_machine() {
         let pool = crate::db::connect_memory().await.unwrap();
         let rec = RecordingNotifier::new();
@@ -550,6 +577,11 @@ mod tests {
         let inc = db::incident(&pool, id).await.unwrap().unwrap();
         assert!(inc.resolved_at.is_some());
     }
+}
+
+/// Absolute link to an incident page under the configured public URL.
+pub fn incident_url(base: &str, id: i64) -> String {
+    format!("{}/incidents/{id}", base.trim_end_matches('/'))
 }
 
 fn sentence_case(text: &str) -> String {

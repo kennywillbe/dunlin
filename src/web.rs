@@ -1106,12 +1106,18 @@ async fn feed(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar)
         return r;
     }
     let cfg = state.cfg();
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost")
-        .to_string();
-    let base = format!("http://{host}");
+    // Feed readers keep these ids, so they should not depend on which Host
+    // header a request came in with when the public address is known.
+    let base = match &cfg.public_url {
+        Some(u) => u.trim_end_matches('/').to_string(),
+        None => {
+            let host = headers
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost");
+            format!("http://{host}")
+        }
+    };
     let incidents = db::recent_incidents(&state.pool, 20)
         .await
         .unwrap_or_default();
