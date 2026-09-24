@@ -263,7 +263,7 @@ fn systemd_default_enabled() -> bool {
 }
 
 /// `[[notifiers]]`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NotifierConfig {
     Telegram {
@@ -515,6 +515,25 @@ impl Config {
             .find(|c| c.check.as_deref() == Some(check_id))
             .map(|c| c.id.clone())
             .unwrap_or_else(|| check_id.to_string())
+    }
+
+    /// Keys whose change only takes effect after a restart, named as in the
+    /// file, for the reload log.
+    pub fn restart_only_changes(&self, new: &Config) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.listen != new.listen {
+            out.push("listen");
+        }
+        if self.data_dir != new.data_dir {
+            out.push("data_dir");
+        }
+        if self.db_path != new.db_path {
+            out.push("db_path");
+        }
+        if self.docker.socket != new.docker.socket {
+            out.push("docker.socket");
+        }
+        out
     }
 
     /// Falls back to UTC only for a config that skipped `validate`.

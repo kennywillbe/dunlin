@@ -94,6 +94,13 @@ pub fn apply_reload(path: &Path, tx: &watch::Sender<Arc<Config>>) {
     match config::load(path) {
         Ok(new) => {
             tracing::info!(path = %path.display(), "configuration reloaded");
+            let pending = tx.borrow().restart_only_changes(&new);
+            if !pending.is_empty() {
+                tracing::warn!(
+                    keys = %pending.join(", "),
+                    "these settings changed but only take effect after a restart"
+                );
+            }
             tx.send_replace(Arc::new(new));
         }
         Err(e) => {
@@ -117,6 +124,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     spawn_config_watcher(config_path, config_tx.clone())?;
     let config_rx = state.config.clone();
 
+    tokio::spawn(notifier_reload_loop(
+        config_rx.clone(),
+        notifiers.clone(),
+        http.clone(),
+        cfg.notifiers.clone(),
+    ));
     tokio::spawn(collector_loop(pool.clone(), config_rx.clone()));
     tokio::spawn(prober_loop(
         pool.clone(),
@@ -143,6 +156,27 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     .await
     .context("http server")?;
     Ok(())
+}
+
+/// Rebuild the notification channels when `[[notifiers]]` changes, so the
+/// alert engine and the daily summary send to the reloaded ones. `built_from`
+/// is the list `notifiers` was made from; taking it from the receiver instead
+/// would miss a reload that lands before this task first runs.
+pub async fn notifier_reload_loop(
+    mut config_rx: watch::Receiver<Arc<Config>>,
+    notifiers: Arc<MultiNotifier>,
+    http: reqwest::Client,
+    built_from: Vec<crate::config::NotifierConfig>,
+) {
+    let mut current = built_from;
+    while config_rx.changed().await.is_ok() {
+        let cfg = config_rx.borrow_and_update().clone();
+        if cfg.notifiers != current {
+            notifiers.replace(build_notifiers(&cfg, &http));
+            current = cfg.notifiers.clone();
+            tracing::info!(channels = current.len(), "notifiers reloaded");
+        }
+    }
 }
 
 fn ensure_docker(cfg: &Config, slot: &mut Option<Arc<dyn DockerSource>>) {
@@ -509,6 +543,51 @@ mod tests {
         std::fs::write(&path, valid2).unwrap();
         apply_reload(&path, &tx);
         assert_eq!(rx.borrow().listen, "127.0.0.1:1234");
+    }
+
+    #[tokio::test]
+    async fn reloaded_notifiers_replace_the_running_ones() {
+        let (tx, rx) = watch::channel(Arc::new(Config::default()));
+        let notifiers = Arc::new(MultiNotifier::new(Vec::new()));
+        let http = prober::http_client().unwrap();
+        tokio::spawn(notifier_reload_loop(
+            rx,
+            notifiers.clone(),
+            http,
+            Vec::new(),
+        ));
+
+        let cfg = Config {
+            notifiers: vec![crate::config::NotifierConfig::Webhook {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: Default::default(),
+            }],
+            ..Config::default()
+        };
+        tx.send_replace(Arc::new(cfg));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while notifiers.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("notifiers were not rebuilt");
+        assert_eq!(notifiers.len(), 1);
+    }
+
+    #[test]
+    fn restart_only_keys_are_named() {
+        let old = Config::default();
+        let mut new = Config {
+            listen: "127.0.0.1:9090".into(),
+            ..Config::default()
+        };
+        new.docker.socket = Some("/run/docker.sock".into());
+        assert_eq!(
+            old.restart_only_changes(&new),
+            vec!["listen", "docker.socket"]
+        );
+        assert!(old.restart_only_changes(&old.clone()).is_empty());
     }
 
     #[tokio::test]

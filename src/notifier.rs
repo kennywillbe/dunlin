@@ -1,7 +1,7 @@
 //! Notification channels behind a `Notifier` trait.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,22 +21,35 @@ pub trait Notifier: Send + Sync {
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fan-out to every configured channel; one broken channel never stops others.
+/// The channel list can be swapped at runtime when the config is reloaded.
 pub struct MultiNotifier {
-    inner: Vec<Arc<dyn Notifier>>,
+    inner: RwLock<Vec<Arc<dyn Notifier>>>,
 }
 
 impl MultiNotifier {
     pub fn new(inner: Vec<Arc<dyn Notifier>>) -> Self {
-        Self { inner }
+        Self {
+            inner: RwLock::new(inner),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.len() == 0
+    }
+
+    /// Replace the channels; sends already under way finish on the old ones.
+    pub fn replace(&self, inner: Vec<Arc<dyn Notifier>>) {
+        *self.inner.write().unwrap() = inner;
     }
 
     /// Send to every channel at once, so the slowest one sets the wait.
     pub async fn send(&self, notification: &Notification) {
-        let sends = self.inner.iter().map(|n| async move {
+        let channels = self.inner.read().unwrap().clone();
+        let sends = channels.iter().map(|n| async move {
             if let Err(e) = n.send(notification).await {
                 tracing::warn!(notifier = n.name(), error = %e, "notification failed");
             }
@@ -246,6 +259,17 @@ mod tests {
         multi.send(&sample()).await;
         assert_eq!(a.count(), 1);
         assert_eq!(b.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn replaced_channels_get_later_sends() {
+        let a = RecordingNotifier::new();
+        let b = RecordingNotifier::new();
+        let multi = MultiNotifier::new(vec![a.clone()]);
+        multi.send(&sample()).await;
+        multi.replace(vec![b.clone()]);
+        multi.send(&sample()).await;
+        assert_eq!((a.count(), b.count()), (1, 1));
     }
 
     #[tokio::test]
