@@ -178,6 +178,20 @@ pub struct Notification {
     pub component: String,
     pub state: State,
     pub incident_id: Option<i64>,
+    /// Incident page under `public_url`. `message` already ends with it, so
+    /// channels that show a link on its own can take it back out.
+    pub link: Option<String>,
+}
+
+impl Notification {
+    /// The message without the trailing incident link.
+    pub fn text(&self) -> &str {
+        self.link
+            .as_deref()
+            .and_then(|l| self.message.strip_suffix(l))
+            .map(|m| m.strip_suffix('\n').unwrap_or(m))
+            .unwrap_or(&self.message)
+    }
 }
 
 #[cfg(test)]

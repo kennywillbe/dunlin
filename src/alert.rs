@@ -281,6 +281,7 @@ impl AlertEngine {
                         component: component.to_string(),
                         state: State::MajorOutage,
                         incident_id: Some(id),
+                        link: None,
                     })
                     .await;
                 }
@@ -304,6 +305,7 @@ impl AlertEngine {
                         component: component.to_string(),
                         state: State::Operational,
                         incident_id: Some(id),
+                        link: None,
                     })
                     .await;
                 }
@@ -317,6 +319,7 @@ impl AlertEngine {
                         component: component.to_string(),
                         state: State::MajorOutage,
                         incident_id: Some(id),
+                        link: None,
                     })
                     .await;
                 }
@@ -327,7 +330,9 @@ impl AlertEngine {
 
     async fn notify(&self, mut n: Notification) {
         if let (Some(base), Some(id)) = (&self.public_url, n.incident_id) {
-            n.message = format!("{}\n{}", n.message, incident_url(base, id));
+            let link = incident_url(base, id);
+            n.message = format!("{}\n{link}", n.message);
+            n.link = Some(link);
         }
         self.notifiers.send(&n).await;
     }
@@ -551,6 +556,11 @@ mod tests {
             sent[0].message,
             format!("boom\nhttps://status.example.org/incidents/{id}")
         );
+        assert_eq!(
+            sent[0].link.as_deref(),
+            Some(format!("https://status.example.org/incidents/{id}").as_str())
+        );
+        assert_eq!(sent[0].text(), "boom");
     }
 
     #[tokio::test]

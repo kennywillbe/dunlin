@@ -20,7 +20,8 @@ Licensed under MIT OR Apache-2.0.
   accent, logo and extra CSS from the config.
 - **Alerts**: per-check failure / recovery / reminder thresholds, incidents
   opened and resolved automatically, optional maintenance windows that mute
-  notifications, Telegram and webhook notifiers, a daily summary.
+  notifications, Telegram, ntfy, Discord, Slack, Pushover and webhook
+  notifiers, a daily summary.
 - **History**: raw per-minute samples for 7 days and hourly aggregates for
   90 days by default; probe results as long as the hourly aggregates, and at
   least the 90 days the status page shows; charts for host, containers and
@@ -130,6 +131,23 @@ The check fails when no ping arrives within `period + grace`. A check that has
 never been pinged gets the same time from when dunlin starts watching it, so a
 new nightly job is not reported down before its first night. Tokens are
 compared in constant time.
+
+## Notifiers
+
+Each `[[notifiers]]` entry is one channel; `dunlin.example.toml` shows the keys
+for every type.
+
+- **ntfy** posts to the server root (`https://ntfy.sh` or your own) with the
+  topic in the body; `token` is optional and sent as a bearer token. Priority
+  goes from 5 for a down alert to 2 for the summary.
+- **Discord** and **Slack** take an incoming webhook URL and get one message
+  coloured by state. Mentions such as `@everyone` never ping. A rate-limited
+  send is retried once.
+- **Pushover** needs an application `token` and a `user` (or group) key. Down
+  alerts use priority 1, everything else 0.
+
+With `public_url` set, the incident link becomes the notification's click
+target instead of a line in the text.
 
 ## Webhook payload
 

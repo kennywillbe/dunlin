@@ -275,6 +275,22 @@ pub enum NotifierConfig {
         #[serde(default)]
         headers: BTreeMap<String, String>,
     },
+    Ntfy {
+        url: String,
+        topic: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    Discord {
+        url: String,
+    },
+    Slack {
+        url: String,
+    },
+    Pushover {
+        token: String,
+        user: String,
+    },
 }
 
 /// `[[groups]]`
@@ -583,11 +599,10 @@ pub fn validate(cfg: &Config) -> Result<()> {
         errs.push(e.to_string());
     }
     if let Some(u) = &cfg.public_url {
-        match url::Url::parse(u) {
-            Ok(p) if matches!(p.scheme(), "http" | "https") && p.host_str().is_some() => {}
-            _ => errs.push(format!(
+        if !is_http_url(u) {
+            errs.push(format!(
                 "public_url {u:?} must be an http(s) URL such as \"https://status.example.org\""
-            )),
+            ));
         }
     }
     if cfg.data_dir.as_os_str().is_empty() {
@@ -691,6 +706,34 @@ pub fn validate(cfg: &Config) -> Result<()> {
                     errs.push(format!("webhook notifier url {url:?} is not a valid URL"));
                 }
             }
+            NotifierConfig::Ntfy { url, topic, token } => {
+                if !is_http_url(url) {
+                    errs.push(format!("ntfy notifier url {url:?} must be an http(s) URL"));
+                }
+                if topic.trim().is_empty() {
+                    errs.push("ntfy notifier needs a topic".to_string());
+                }
+                if token.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                    errs.push("ntfy notifier token must not be empty when set".to_string());
+                }
+            }
+            NotifierConfig::Discord { url } => {
+                if !is_http_url(url) {
+                    errs.push(format!(
+                        "discord notifier url {url:?} must be an http(s) URL"
+                    ));
+                }
+            }
+            NotifierConfig::Slack { url } => {
+                if !is_http_url(url) {
+                    errs.push(format!("slack notifier url {url:?} must be an http(s) URL"));
+                }
+            }
+            NotifierConfig::Pushover { token, user } => {
+                if token.trim().is_empty() || user.trim().is_empty() {
+                    errs.push("pushover notifier needs token and user".to_string());
+                }
+            }
         }
     }
 
@@ -702,6 +745,11 @@ pub fn validate(cfg: &Config) -> Result<()> {
             errs.join("\n  - ")
         ))
     }
+}
+
+fn is_http_url(u: &str) -> bool {
+    url::Url::parse(u)
+        .is_ok_and(|p| matches!(p.scheme(), "http" | "https") && p.host_str().is_some())
 }
 
 fn validate_check(c: &CheckConfig, errs: &mut Vec<String>) {
@@ -885,6 +933,81 @@ check = "nope"
             let err = parse_str(&with(bad)).unwrap_err().to_string();
             assert!(err.contains("public_url"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn chat_notifiers_parse_and_compare() {
+        let s = format!(
+            r#"{}
+[[notifiers]]
+type = "ntfy"
+url = "https://ntfy.sh"
+topic = "alerts"
+[[notifiers]]
+type = "discord"
+url = "https://discord.com/api/webhooks/1/x"
+[[notifiers]]
+type = "slack"
+url = "https://hooks.slack.com/services/x"
+[[notifiers]]
+type = "pushover"
+token = "app"
+user = "me"
+"#,
+            base_with_real_hash()
+        );
+        let cfg = parse_str(&s).unwrap();
+        assert_eq!(cfg.notifiers.len(), 4);
+        assert_eq!(
+            cfg.notifiers[0],
+            NotifierConfig::Ntfy {
+                url: "https://ntfy.sh".into(),
+                topic: "alerts".into(),
+                token: None,
+            }
+        );
+        // Reload rebuilds the channels only when this comparison differs.
+        let changed = parse_str(&s.replace("alerts", "other")).unwrap();
+        assert_ne!(cfg.notifiers, changed.notifiers);
+    }
+
+    #[test]
+    fn chat_notifiers_validated() {
+        let with = |n: &str| format!("{}\n[[notifiers]]\n{n}\n", base_with_real_hash());
+        let cases = [
+            (
+                "type = \"ntfy\"\nurl = \"ntfy.sh\"\ntopic = \"a\"",
+                "ntfy notifier url",
+            ),
+            (
+                "type = \"ntfy\"\nurl = \"https://ntfy.sh\"\ntopic = \" \"",
+                "topic",
+            ),
+            (
+                "type = \"ntfy\"\nurl = \"https://ntfy.sh\"\ntopic = \"a\"\ntoken = \"\"",
+                "token must not be empty",
+            ),
+            (
+                "type = \"discord\"\nurl = \"ftp://x.org\"",
+                "discord notifier url",
+            ),
+            ("type = \"slack\"\nurl = \"\"", "slack notifier url"),
+            (
+                "type = \"pushover\"\ntoken = \"\"\nuser = \"u\"",
+                "pushover",
+            ),
+            (
+                "type = \"pushover\"\ntoken = \"t\"\nuser = \"\"",
+                "pushover",
+            ),
+        ];
+        for (n, want) in cases {
+            let err = parse_str(&with(n)).unwrap_err().to_string();
+            assert!(err.contains(want), "{n}: {err}");
+        }
+        // A missing required key is a parse error rather than a validation one.
+        assert!(parse_str(&with("type = \"pushover\"\ntoken = \"t\"")).is_err());
+        assert!(parse_str(&with("type = \"ntfy\"\nurl = \"https://ntfy.sh\"")).is_err());
     }
 
     #[test]

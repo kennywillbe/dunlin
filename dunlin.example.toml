@@ -88,7 +88,7 @@ enabled = false
 # Query unit state over the system D-Bus. Default: true on Linux, false elsewhere.
 enabled = true
 
-# Notification channels. Add zero or more. Both types may be repeated.
+# Notification channels. Add zero or more; any type may be repeated.
 [[notifiers]]
 type = "telegram"
 token = "123456:REPLACE"
@@ -100,6 +100,26 @@ url = "https://example.org/dunlin-hook"
 # Optional HTTP headers sent with every webhook.
 [notifiers.headers]
 Authorization = "Bearer REPLACE"
+
+# More channels; uncomment the ones you use.
+# [[notifiers]]
+# type = "ntfy"
+# url = "https://ntfy.sh"          # server root, self-hosted works too
+# topic = "dunlin-alerts"
+# token = "tk_REPLACE"             # optional access token
+#
+# [[notifiers]]
+# type = "discord"
+# url = "https://discord.com/api/webhooks/REPLACE"
+#
+# [[notifiers]]
+# type = "slack"
+# url = "https://hooks.slack.com/services/REPLACE"
+#
+# [[notifiers]]
+# type = "pushover"
+# token = "REPLACE"                # application API token
+# user = "REPLACE"                 # user or group key
 
 # Groups organise components on the status page.
 [[groups]]

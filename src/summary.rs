@@ -83,6 +83,7 @@ pub fn compose(
         component: String::new(),
         state: State::Operational,
         incident_id: None,
+        link: None,
     }
 }
 
