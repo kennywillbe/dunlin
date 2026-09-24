@@ -302,6 +302,17 @@ pub struct SubscriptionsConfig {
     pub enabled: bool,
     #[serde(default)]
     pub email: Option<EmailConfig>,
+    #[serde(default)]
+    pub webhook: Option<SubscriberWebhookConfig>,
+}
+
+/// `[subscriptions.webhook]`: visitors give an https URL (Slack, Discord or
+/// any JSON endpoint) that updates are posted to.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriberWebhookConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// How the SMTP connection is encrypted. There is no plaintext option: the
@@ -1201,6 +1212,27 @@ user = "me"
         assert!(parse_str(&with("host = \"h\"\nfrom = \"s@example.org\"\nbogus = 1")).is_err());
         // A missing host or sender is a parse error too.
         assert!(parse_str(&with("from = \"s@example.org\"")).is_err());
+    }
+
+    #[test]
+    fn subscriber_webhook_config() {
+        let with = |t: &str| {
+            format!(
+                "public_url = \"https://status.example.org\"\n{}\n[subscriptions]\nenabled = true\n[subscriptions.webhook]\n{t}\n",
+                base_with_real_hash()
+            )
+        };
+        let cfg = parse_str(&with("enabled = true")).unwrap();
+        assert!(cfg.subscriptions.webhook.unwrap().enabled);
+        assert!(
+            !parse_str(&with(""))
+                .unwrap()
+                .subscriptions
+                .webhook
+                .unwrap()
+                .enabled
+        );
+        assert!(parse_str(&with("url = \"x\"")).is_err());
     }
 
     #[test]

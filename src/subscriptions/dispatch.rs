@@ -68,6 +68,8 @@ pub struct Delivery {
     pub site_title: String,
     /// The configured zone, for writing times the way the page does.
     pub timezone: chrono_tz::Tz,
+    /// `public_url`, for payloads that name the page.
+    pub site_url: Option<String>,
     pub message: Message,
 }
 
@@ -84,6 +86,72 @@ impl std::fmt::Display for PermanentFailure {
 }
 
 impl std::error::Error for PermanentFailure {}
+
+/// A failed send that is retried as usual but counts toward quarantine: the
+/// endpoint looks broken rather than busy. A `PermanentFailure` counts too.
+#[derive(Debug)]
+pub struct CountedFailure(pub String);
+
+impl std::fmt::Display for CountedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CountedFailure {}
+
+/// Counted failures that quarantine a subscriber, and the window they are
+/// counted in. The window starts at the first failure and a success clears
+/// it, so a flaky endpoint that recovers starts over.
+pub const QUARANTINE_FAILURES: i64 = 10;
+pub const QUARANTINE_WINDOW_SECS: i64 = 3600;
+
+/// Count one failure against a subscriber, quarantining it at the limit.
+/// Quarantined subscribers get nothing; their queued messages are held
+/// until they sign up again or the rollup deletes them.
+async fn count_failure(pool: &Pool, subscriber_id: i64, now: i64) -> Result<bool> {
+    let row = sqlx::query(
+        "UPDATE subscribers SET
+           failures_in_window = CASE
+             WHEN failure_window_start IS NULL OR failure_window_start <= ?1 - ?2 THEN 1
+             ELSE failures_in_window + 1 END,
+           failure_window_start = CASE
+             WHEN failure_window_start IS NULL OR failure_window_start <= ?1 - ?2 THEN ?1
+             ELSE failure_window_start END
+         WHERE id = ?3 RETURNING failures_in_window",
+    )
+    .bind(now)
+    .bind(QUARANTINE_WINDOW_SECS)
+    .bind(subscriber_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(failures) = row.map(|r| r.get::<i64, _>("failures_in_window")) else {
+        return Ok(false);
+    };
+    if failures < QUARANTINE_FAILURES {
+        return Ok(false);
+    }
+    let res = sqlx::query(
+        "UPDATE subscribers SET status = 'quarantined', quarantined_at = ?
+         WHERE id = ? AND status <> 'quarantined'",
+    )
+    .bind(now)
+    .bind(subscriber_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+async fn clear_failures(pool: &Pool, subscriber_id: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE subscribers SET failures_in_window = 0, failure_window_start = NULL
+         WHERE id = ? AND failures_in_window > 0",
+    )
+    .bind(subscriber_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
 
 #[async_trait]
 pub trait SubscriberChannel: Send + Sync {
@@ -144,6 +212,17 @@ pub fn build_channels(cfg: &Config) -> Vec<Arc<dyn SubscriberChannel>> {
         match super::email::EmailChannel::new(email) {
             Ok(c) => out.push(Arc::new(c)),
             Err(e) => tracing::warn!(error = %e, "email subscriptions unavailable"),
+        }
+    }
+    if cfg
+        .subscriptions
+        .webhook
+        .as_ref()
+        .is_some_and(|w| w.enabled)
+    {
+        match super::webhook::WebhookChannel::new() {
+            Ok(c) => out.push(Arc::new(c)),
+            Err(e) => tracing::warn!(error = %e, "webhook subscriptions unavailable"),
         }
     }
     out
@@ -207,6 +286,7 @@ pub struct DispatchStats {
     pub sent: usize,
     pub retried: usize,
     pub given_up: usize,
+    pub quarantined: usize,
 }
 
 /// Send every due outbox row once. Rows for channels that are not switched
@@ -297,6 +377,7 @@ pub async fn dispatch_due(
             address: address.clone(),
             site_title: cfg.theme.title.trim().to_string(),
             timezone: cfg.tz(),
+            site_url: cfg.public_url.clone(),
             message,
         };
         let result = match tokio::time::timeout(SEND_LIMIT, channel.send(&delivery)).await {
@@ -319,12 +400,19 @@ pub async fn dispatch_due(
                 .bind(id)
                 .execute(pool)
                 .await?;
+                clear_failures(pool, sid).await?;
                 stats.sent += 1;
             }
             Err(e) => {
                 let error: String = format!("{e:#}").chars().take(500).collect();
                 tracing::warn!(outbox = id, channel = %channel_name, attempts, error = %error, "subscriber message failed");
                 let permanent = e.downcast_ref::<PermanentFailure>().is_some();
+                if (permanent || e.downcast_ref::<CountedFailure>().is_some())
+                    && count_failure(pool, sid, now).await?
+                {
+                    tracing::warn!(subscriber = sid, channel = %channel_name, "subscriber quarantined after repeated failures");
+                    stats.quarantined += 1;
+                }
                 if permanent || attempts >= MAX_ATTEMPTS {
                     sqlx::query("UPDATE outbox SET failed_at = ?, attempts = ?, last_error = ? WHERE id = ?")
                         .bind(now)

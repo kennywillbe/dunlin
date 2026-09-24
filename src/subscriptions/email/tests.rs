@@ -150,6 +150,7 @@ fn event_delivery(event: SubscriberEvent) -> Delivery {
         address: "jane@example.org".into(),
         site_title: "Acme Status".into(),
         timezone: chrono_tz::Europe::Istanbul,
+        site_url: Some("https://status.example.org".into()),
         message: Message::Event {
             event,
             unsubscribe_url: "https://status.example.org/unsubscribe/abc123".into(),
@@ -417,4 +418,48 @@ async fn the_channel_is_on_only_when_both_tables_say_so() {
     assert!(names(true, Some(false)).is_empty());
     assert!(names(true, None).is_empty());
     assert!(names(false, Some(true)).is_empty());
+}
+
+#[tokio::test]
+async fn dead_mailboxes_count_toward_quarantine() {
+    use sqlx::Row;
+    let pool = crate::db::connect_memory().await.unwrap();
+    let mut cfg = crate::config::Config {
+        public_url: Some("https://status.example.org".into()),
+        ..Default::default()
+    };
+    cfg.subscriptions.enabled = true;
+    let req = crate::subscriptions::SignUp {
+        channel: "email".into(),
+        address: "gone@example.org".into(),
+        all_components: true,
+        components: vec![],
+        maintenance: false,
+    };
+    crate::subscriptions::sign_up(&pool, &req, 0).await.unwrap();
+    sqlx::query("UPDATE subscribers SET status = 'active'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM outbox")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..crate::subscriptions::dispatch::QUARANTINE_FAILURES {
+        crate::subscriptions::publish(&pool, &cfg, &opened(), 0)
+            .await
+            .unwrap();
+    }
+    let (port, _) = fake_smtp("550 5.1.1 no such user\r\n").await;
+    let channels = Channels::new(vec![Arc::new(channel(port))]);
+    let stats = dispatch_due(&pool, &cfg, &channels, &mut Pacer::default(), 1)
+        .await
+        .unwrap();
+    assert_eq!((stats.given_up, stats.quarantined), (10, 1));
+    let status: String = sqlx::query("SELECT status FROM subscribers")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("status");
+    assert_eq!(status, "quarantined");
 }

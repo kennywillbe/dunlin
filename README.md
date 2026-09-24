@@ -232,6 +232,57 @@ Whether the mail reaches inboxes depends on the sending domain: set up SPF,
 DKIM and DMARC for the `from` domain with your mail provider. dunlin only
 hands the mail to your SMTP server and cannot do this for you.
 
+### Webhooks
+
+```toml
+[subscriptions.webhook]
+enabled = true
+```
+
+Visitors give an https URL. A Slack incoming webhook (`hooks.slack.com`) gets a
+coloured Slack message and a Discord webhook (`discord.com/api/webhooks/…`) an
+embed, with mentions such as `@everyone` switched off. Any other URL gets a
+JSON `POST`:
+
+```json
+{
+  "event": "incident_opened",
+  "meta": { "unsubscribe": "https://status.example.org/unsubscribe/…", "generated_at": 1758700000 },
+  "page": { "title": "Acme Status", "url": "https://status.example.org" },
+  "incident": {
+    "id": 12, "title": "Homepage is down",
+    "component": { "id": "homepage", "name": "Homepage" },
+    "impact": "major_outage", "state": "investigating",
+    "message": "Connection refused.", "url": "https://status.example.org/incidents/12"
+  }
+}
+```
+
+- `event`: `confirm`, `incident_opened`, `incident_updated`,
+  `incident_resolved`, `maintenance_scheduled`, `maintenance_started`,
+  `maintenance_completed` or `maintenance_cancelled`.
+- Maintenance events carry `maintenance` instead of `incident`: `id`,
+  `component`, `note`, `starts_at`, `ends_at` (Unix seconds) and `url`.
+- `confirm` carries `confirm.url`. The confirmation is posted to the URL
+  itself, so only someone who can read that channel can confirm it.
+- `component.id` is empty for all components.
+
+The URL must be https on port 443, with no user name or password in it.
+dunlin will not post to loopback, private, CGNAT, link-local (cloud metadata),
+multicast, documentation or other reserved addresses, whether the URL names
+one directly or a DNS name resolves to one. It does not follow redirects and
+does not go through an HTTP proxy. Replies other than 2xx count as failures;
+404 and 410 (a deleted webhook) give that message up at once, and 429 is
+retried without counting.
+
+#### Quarantine
+
+A subscriber whose webhook fails 10 times within an hour, or whose mail
+server refuses the mailbox 10 times (550, 551, 553), is quarantined: nothing
+more is sent, and its queued messages are held. After 90 days in quarantine
+it is deleted. Signing up again with the same address starts over with a new
+confirmation and drops the held messages. A successful send clears the count.
+
 ## Badges
 
 Each component has badges for READMEs and other dashboards, showing the same

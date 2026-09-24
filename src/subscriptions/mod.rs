@@ -9,6 +9,7 @@
 
 pub mod dispatch;
 pub mod email;
+pub mod webhook;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,9 @@ pub const CONFIRM_RESEND_SECS: i64 = 15 * 60;
 pub const OUTBOX_KEEP_SECS: i64 = 30 * 86_400;
 /// Pending subscribers are deleted this long after their link expired.
 pub const PENDING_KEEP_SECS: i64 = 7 * 86_400;
+/// Quarantined subscribers are deleted after this long, if they have not
+/// signed up again.
+pub const QUARANTINE_KEEP_SECS: i64 = 90 * 86_400;
 
 const KEY_META: &str = "subscription_key";
 
@@ -488,6 +492,16 @@ pub async fn sign_up(pool: &Pool, req: &SignUp, now: i64) -> Result<()> {
                 tx.commit().await?;
                 return Ok(());
             }
+            if status == "quarantined" {
+                // Held while the endpoint was failing; by the time it is
+                // confirmed again, that news is stale.
+                sqlx::query(
+                    "DELETE FROM outbox WHERE subscriber_id = ? AND sent_at IS NULL AND failed_at IS NULL",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
             sqlx::query(
                 "UPDATE subscribers SET all_components = ?, maintenance = ?, status = 'pending',
                    failure_window_start = NULL, failures_in_window = 0, quarantined_at = NULL
@@ -700,6 +714,10 @@ pub async fn prune(pool: &Pool, now: i64) -> Result<()> {
         .await?;
     sqlx::query("DELETE FROM subscribers WHERE status = 'pending' AND confirm_expires < ?")
         .bind(now - PENDING_KEEP_SECS)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM subscribers WHERE status = 'quarantined' AND quarantined_at < ?")
+        .bind(now - QUARANTINE_KEEP_SECS)
         .execute(pool)
         .await?;
     Ok(())

@@ -190,7 +190,7 @@ fn truncate_bytes(s: &str, max: usize) -> String {
 
 /// Cut `s` to at most `max` chars, ending in "…" when cut. Discord and
 /// Pushover count their limits in characters, not bytes.
-fn truncate_chars(s: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -378,7 +378,7 @@ pub struct SlackNotifier {
 
 /// Slack reads `&`, `<` and `>` as markup; `&` goes first so the entities
 /// added for the other two are not escaped again.
-fn slack_escape(s: &str) -> String {
+pub(crate) fn slack_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

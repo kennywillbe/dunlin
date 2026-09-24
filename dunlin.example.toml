@@ -141,6 +141,10 @@ Authorization = "Bearer REPLACE"
 # username = "status@example.org" # optional, with password
 # password = "REPLACE"
 # from = "Status <status@example.org>"
+#
+# Visitors' own webhook URLs: Slack, Discord or any https JSON endpoint.
+# [subscriptions.webhook]
+# enabled = true
 
 # Groups organise components on the status page.
 [[groups]]

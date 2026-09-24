@@ -23,6 +23,8 @@ fn cfg() -> Config {
 struct Fake {
     sent: Mutex<Vec<Delivery>>,
     fail: AtomicUsize,
+    /// Fail with `CountedFailure`, as a broken endpoint does.
+    counted: bool,
     pacing: Pacing,
 }
 
@@ -49,6 +51,9 @@ impl SubscriberChannel for Fake {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
+            if self.counted {
+                return Err(CountedFailure("broken".into()).into());
+            }
             anyhow::bail!("boom");
         }
         self.sent.lock().unwrap().push(delivery.clone());
@@ -755,4 +760,119 @@ fn tokens_depend_on_key_row_and_nonce() {
     assert_ne!(a, confirm_token("k", 2, 100));
     assert_ne!(a, confirm_token("other", 1, 100));
     assert_ne!(a, unsubscribe_token("k", 1, 100));
+}
+
+async fn status_and_failures(pool: &Pool) -> (String, i64) {
+    let r = sqlx::query("SELECT status, failures_in_window FROM subscribers")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (r.get("status"), r.get("failures_in_window"))
+}
+
+fn broken() -> Arc<Fake> {
+    Arc::new(Fake {
+        fail: AtomicUsize::new(usize::MAX),
+        counted: true,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn ten_counted_failures_in_an_hour_quarantine() {
+    let pool = db::connect_memory().await.unwrap();
+    active(&pool, "a", true, &[], false).await;
+    let cfg = cfg();
+    for _ in 0..QUARANTINE_FAILURES {
+        publish(&pool, &cfg, &incident("web"), 0).await.unwrap();
+    }
+    let fake = broken();
+    let stats = dispatch_due(&pool, &cfg, &channels(&fake), &mut Pacer::default(), 0)
+        .await
+        .unwrap();
+    assert_eq!(stats.quarantined, 1);
+    assert_eq!(
+        status_and_failures(&pool).await,
+        ("quarantined".to_string(), 10)
+    );
+
+    // Held: nothing is tried, and nothing is thrown away either.
+    fake.fail.store(0, Ordering::SeqCst);
+    let stats = dispatch_due(&pool, &cfg, &channels(&fake), &mut Pacer::default(), 86_400)
+        .await
+        .unwrap();
+    assert_eq!(stats, DispatchStats::default());
+    assert!(fake.sent.lock().unwrap().is_empty());
+    let held: i64 =
+        sqlx::query("SELECT COUNT(*) AS n FROM outbox WHERE sent_at IS NULL AND failed_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("n");
+    assert_eq!(held, 10);
+
+    // Signing up again starts over: stale messages go, a confirmation comes.
+    sign_up(&pool, &signup("a", true, &[], false), 90_000)
+        .await
+        .unwrap();
+    assert_eq!(status_and_failures(&pool).await, ("pending".to_string(), 0));
+    assert_eq!(kinds(&pool).await, ["confirm"]);
+}
+
+#[tokio::test]
+async fn failures_count_per_hour_and_success_clears_them() {
+    let pool = db::connect_memory().await.unwrap();
+    active(&pool, "a", true, &[], false).await;
+    let cfg = cfg();
+    for _ in 0..9 {
+        publish(&pool, &cfg, &incident("web"), 0).await.unwrap();
+    }
+    let fake = broken();
+    dispatch_due(&pool, &cfg, &channels(&fake), &mut Pacer::default(), 0)
+        .await
+        .unwrap();
+    assert_eq!(status_and_failures(&pool).await, ("active".to_string(), 9));
+    // An hour on, the window starts over at the next failure.
+    dispatch_due(&pool, &cfg, &channels(&fake), &mut Pacer::default(), 3600)
+        .await
+        .unwrap();
+    assert_eq!(status_and_failures(&pool).await, ("active".to_string(), 9));
+    // One success wipes the slate.
+    fake.fail.store(0, Ordering::SeqCst);
+    dispatch_due(&pool, &cfg, &channels(&fake), &mut Pacer::default(), 99_999)
+        .await
+        .unwrap();
+    assert_eq!(status_and_failures(&pool).await, ("active".to_string(), 0));
+}
+
+#[tokio::test]
+async fn busy_failures_do_not_count() {
+    let pool = db::connect_memory().await.unwrap();
+    active(&pool, "a", true, &[], false).await;
+    let cfg = cfg();
+    for _ in 0..12 {
+        publish(&pool, &cfg, &incident("web"), 0).await.unwrap();
+    }
+    let fake = Arc::new(Fake {
+        fail: AtomicUsize::new(usize::MAX),
+        ..Default::default()
+    });
+    dispatch_due(&pool, &cfg, &channels(&fake), &mut Pacer::default(), 0)
+        .await
+        .unwrap();
+    assert_eq!(status_and_failures(&pool).await, ("active".to_string(), 0));
+}
+
+#[tokio::test]
+async fn quarantined_subscribers_go_after_90_days() {
+    let pool = db::connect_memory().await.unwrap();
+    active(&pool, "a", true, &[], false).await;
+    sqlx::query("UPDATE subscribers SET status = 'quarantined', quarantined_at = 100")
+        .execute(&pool)
+        .await
+        .unwrap();
+    prune(&pool, 100 + QUARANTINE_KEEP_SECS).await.unwrap();
+    assert_eq!(list(&pool).await.unwrap().len(), 1);
+    prune(&pool, 101 + QUARANTINE_KEEP_SECS).await.unwrap();
+    assert!(list(&pool).await.unwrap().is_empty());
 }
