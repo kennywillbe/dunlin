@@ -64,6 +64,7 @@ accent = "#17150f"
 # Keep raw per-minute samples for this many days. Default: 7
 raw_days = 7
 # Keep hourly aggregates for this many days. Default: 90
+# Probe results (uptime bars) are kept as long, but never under 90 days.
 hourly_days = 90
 
 # Daily summary message (also proves dunlin is running). Optional; omit to

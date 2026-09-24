@@ -22,7 +22,9 @@ Licensed under MIT OR Apache-2.0.
   opened and resolved automatically, optional maintenance windows that mute
   notifications, Telegram and webhook notifiers, a daily summary.
 - **History**: raw per-minute samples for 7 days and hourly aggregates for
-  90 days by default; charts for host, containers and check latency.
+  90 days by default; probe results as long as the hourly aggregates, and at
+  least the 90 days the status page shows; charts for host, containers and
+  check latency.
 - **Web**: read pages are public by default; incidents and maintenance are
   managed on `/manage`, and every write action needs the password (argon2, per-IP login rate limit, CSRF check). `protect_read = true`
   puts the read pages behind the password too.
