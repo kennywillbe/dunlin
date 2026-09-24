@@ -29,7 +29,8 @@ Licensed under MIT OR Apache-2.0.
   managed on `/manage`, and every write action needs the password (argon2, per-IP login rate limit, CSRF check). `protect_read = true`
   puts the read pages behind the password too.
 - **Config** is a TOML file that is reloaded on change; an invalid new file is
-  logged and the running configuration is kept.
+  logged and the running configuration is kept. `listen`, `data_dir`,
+  `db_path` and `docker.socket` need a restart; a change to them is logged.
 
 ## Install (native binary + systemd)
 
