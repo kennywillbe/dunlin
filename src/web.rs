@@ -1228,6 +1228,7 @@ async fn manage_page(State(state): State<AppState>, jar: CookieJar) -> Response 
             .collect(),
         maintenance: maintenance_views(&cfg, &windows, now),
         active_incidents: incident_views(&state.pool, &cfg, &active, now).await,
+        timezone: cfg.tz().name().to_string(),
     })
 }
 
@@ -2147,9 +2148,27 @@ struct MaintenanceForm {
     component: String,
     note: String,
     duration_minutes: i64,
-    /// Optional explicit start offset in seconds; defaults to now.
+    /// Wall time from the form's `datetime-local` field, in the configured
+    /// timezone. Empty starts now. Wins over `starts_in_seconds`.
+    #[serde(default)]
+    starts_at: String,
+    /// Start offset in seconds, from before `starts_at` existed.
     #[serde(default)]
     starts_in_seconds: Option<i64>,
+}
+
+/// Read a `datetime-local` value (`2026-09-24T14:30`, seconds optional) as
+/// wall time in `tz`.
+fn parse_local_start(value: &str, tz: chrono_tz::Tz) -> Option<i64> {
+    let value = value.trim();
+    [
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ]
+    .iter()
+    .find_map(|f| chrono::NaiveDateTime::parse_from_str(value, f).ok())
+    .map(|local| crate::days::local_to_ts(local, tz))
 }
 
 async fn start_maintenance(
@@ -2165,11 +2184,29 @@ async fn start_maintenance(
     // Clamped so a typo cannot overflow the timestamps; a window longer than
     // a year, or starting further out, is not a maintenance window.
     let duration = form.duration_minutes.clamp(1, MAX_MAINTENANCE_SECS / 60) * 60;
-    let starts = now
-        + form
+    let starts = if form.starts_at.trim().is_empty() {
+        now + form
             .starts_in_seconds
             .unwrap_or(0)
-            .clamp(0, MAX_MAINTENANCE_SECS);
+            .clamp(0, MAX_MAINTENANCE_SECS)
+    } else {
+        let cfg = state.cfg();
+        let Some(ts) = parse_local_start(&form.starts_at, cfg.tz()) else {
+            // Starting now instead would mute alerts nobody asked to mute.
+            return error_page(
+                &cfg,
+                StatusCode::BAD_REQUEST,
+                "That start time is not valid",
+                SideView::plain(
+                    &format!("{:?} is not a date and time.", form.starts_at),
+                    "Go back and pick one with the field's picker, or leave it empty to start now.",
+                ),
+            );
+        };
+        // /manage has nowhere to show a form error, and a start a few
+        // minutes back is just a form filled in slowly, so the past is now.
+        ts.clamp(now, now + MAX_MAINTENANCE_SECS)
+    };
     if let Err(e) = db::create_maintenance(
         &state.pool,
         &form.component,

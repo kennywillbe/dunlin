@@ -37,7 +37,7 @@
 
   <section class="form-section" aria-labelledby="new-maintenance">
     <h2 id="new-maintenance" class="form-title">Start maintenance</h2>
-    <p class="soft">Alerts for the component are muted while the window is open.</p>
+    <p class="soft">Alerts for the component are muted while the window is open. Leave the start empty to begin now, or pick a time to plan it.</p>
     <form method="post" action="/maintenance" class="form">
       <div class="field">
         <label for="m-component">Component</label>
@@ -45,6 +45,10 @@
           <option value="">All components</option>
           {% for c in components %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
         </select>
+      </div>
+      <div class="field">
+        <label for="m-starts">Starts at ({{ timezone }})</label>
+        <input id="m-starts" type="datetime-local" name="starts_at">
       </div>
       <div class="field">
         <label for="m-duration">Duration in minutes</label>

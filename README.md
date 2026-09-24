@@ -19,8 +19,8 @@ Licensed under MIT OR Apache-2.0.
   feed, SVG status and uptime badges. A plain sentence at the top says what
   is wrong right now. Title, accent, logo and extra CSS from the config.
 - **Alerts**: per-check failure / recovery / reminder thresholds, incidents
-  opened and resolved automatically, optional maintenance windows that mute
-  notifications, Telegram, ntfy, Discord, Slack, Pushover and webhook
+  opened and resolved automatically, maintenance windows (now or planned
+  ahead) that mute notifications while open, Telegram, ntfy, Discord, Slack, Pushover and webhook
   notifiers, a daily summary.
 - **History**: raw per-minute samples for 7 days and hourly aggregates for
   90 days by default; probe results as long as the hourly aggregates, and at
@@ -91,6 +91,12 @@ Durations accept `30s`, `5m`, `1h30m`, `7d` or a bare number of seconds.
 lately" rows, the month groups on `/incidents` and when the daily summary is
 sent. Times of day are still shown in each visitor's own zone by the page
 script. Day and month labels are not, they stay in the configured zone.
+
+Maintenance planned on `/manage` starts at a wall time in this zone; the
+field's label names it. A time skipped by a DST change starts when the clock
+resumes, a repeated one at its first occurrence. An empty start means now, a
+start in the past is moved to now and one more than a year out to a year.
+A planned window shows on the status page but mutes nothing until it starts.
 
 DST days are 23 or 25 hours long and count as one day each. Per-day uptime is
 summed from 15-minute slots, which lines up with every offset in use today

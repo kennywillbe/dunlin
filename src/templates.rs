@@ -364,6 +364,8 @@ pub struct ManageTemplate {
     pub components: Vec<NavComponent>,
     pub maintenance: Vec<MaintenanceView>,
     pub active_incidents: Vec<IncidentView>,
+    /// Zone the "Starts at" field is read in, named on its label.
+    pub timezone: String,
 }
 
 #[derive(Template)]

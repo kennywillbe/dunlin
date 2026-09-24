@@ -1629,3 +1629,159 @@ async fn public_api_ignores_keys() {
         assert_eq!(send(app.clone(), req).await.0, StatusCode::OK, "{uri}");
     }
 }
+
+async fn state_in_zone(tz: &str) -> (AppState, Pool) {
+    let toml = format!("timezone = \"{tz}\"\n{}", config_toml(false, ""));
+    state_from(Arc::new(config::parse_str(&toml).unwrap())).await
+}
+
+/// Post the maintenance form and return the window it created.
+async fn plan(
+    app: &Router,
+    pool: &Pool,
+    cookie: &str,
+    fields: &str,
+) -> dunlin::models::Maintenance {
+    let mut req = post_form(
+        "/maintenance",
+        &format!("component=web&duration_minutes=30&note=upgrade{fields}"),
+    );
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, body) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    db::all_maintenance(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|m| m.id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn planned_maintenance_in_the_configured_zone() {
+    use chrono::TimeZone;
+    let (state, pool) = state_in_zone("Europe/Istanbul").await;
+    let app = app(state);
+    let cookie = login(&app).await;
+
+    let tz = chrono_tz::Europe::Istanbul;
+    let day = (chrono::Utc::now() + chrono::Duration::days(2))
+        .with_timezone(&tz)
+        .date_naive();
+    let local = day.and_hms_opt(14, 30, 0).unwrap();
+    let want = tz.from_local_datetime(&local).single().unwrap().timestamp();
+    // Istanbul is UTC+3 all year.
+    assert_eq!(want, local.and_utc().timestamp() - 3 * 3600);
+
+    let field = format!("&starts_at={}", local.format("%Y-%m-%dT%H:%M"));
+    let m = plan(&app, &pool, &cookie, &field).await;
+    assert_eq!((m.starts_at, m.ends_at), (want, want + 1800));
+
+    let mut req = get("/manage");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (_, _, body) = send(app.clone(), req).await;
+    assert!(body.contains("Starts at (Europe/Istanbul)"), "{body}");
+    assert!(
+        body.contains(r#"type="datetime-local" name="starts_at""#),
+        "{body}"
+    );
+    assert!(body.contains(r#"<span class="d">planned</span>"#), "{body}");
+
+    // The public page announces it but the component is not in maintenance yet.
+    let (_, _, body) = send(app.clone(), get("/")).await;
+    assert!(body.contains("Maintenance on Website starts"), "{body}");
+    assert!(!body.contains("svc s-maintenance"), "{body}");
+    let (_, _, badge) = send(app, get("/badge/web.svg")).await;
+    assert!(badge.contains("Website: operational"), "{badge}");
+}
+
+#[tokio::test]
+async fn planned_start_in_a_dst_gap_moves_to_when_the_clock_resumes() {
+    use chrono::{Datelike, TimeZone};
+    let (state, pool) = state_in_zone("Europe/Berlin").await;
+    let app = app(state);
+    let cookie = login(&app).await;
+
+    let tz = chrono_tz::Europe::Berlin;
+    let now = chrono::Utc::now();
+    // The next spring-forward night: the last Sunday of March.
+    let gap_day = [now.year(), now.year() + 1]
+        .into_iter()
+        .map(|y| {
+            let mut d = chrono::NaiveDate::from_ymd_opt(y, 3, 31).unwrap();
+            while d.weekday() != chrono::Weekday::Sun {
+                d = d.pred_opt().unwrap();
+            }
+            d
+        })
+        .find(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc() > now)
+        .unwrap();
+    let in_gap = gap_day.and_hms_opt(2, 30, 0).unwrap();
+    assert!(tz.from_local_datetime(&in_gap).single().is_none());
+    let resumes = tz
+        .from_local_datetime(&gap_day.and_hms_opt(3, 0, 0).unwrap())
+        .single()
+        .unwrap()
+        .timestamp();
+
+    let field = format!("&starts_at={}", in_gap.format("%Y-%m-%dT%H:%M"));
+    let m = plan(&app, &pool, &cookie, &field).await;
+    assert_eq!(m.starts_at, resumes);
+}
+
+#[tokio::test]
+async fn maintenance_start_defaults_clamps_and_rejects() {
+    let (state, pool) = state_in_zone("Europe/Istanbul").await;
+    let app = app(state);
+    let cookie = login(&app).await;
+    let year = 366 * 86_400;
+    let fmt = |ts: i64| {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .unwrap()
+            .with_timezone(&chrono_tz::Europe::Istanbul)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string()
+    };
+    let cases: Vec<(String, i64)> = vec![
+        // Empty (or absent) starts now, as before.
+        (String::new(), 0),
+        ("&starts_at=".into(), 0),
+        // The old offset field still works on its own...
+        ("&starts_in_seconds=600".into(), 600),
+        // ...but a filled-in start wins over it.
+        (
+            format!(
+                "&starts_in_seconds=600&starts_at={}",
+                fmt(dunlin::now_ts() + 7200)
+            ),
+            7200,
+        ),
+        // A start in the past begins now; one past a year is pulled in.
+        (format!("&starts_at={}", fmt(dunlin::now_ts() - 86_400)), 0),
+        (
+            format!("&starts_at={}", fmt(dunlin::now_ts() + 3 * year)),
+            year,
+        ),
+    ];
+    for (fields, offset) in cases {
+        let before = dunlin::now_ts();
+        let m = plan(&app, &pool, &cookie, &fields).await;
+        let after = dunlin::now_ts();
+        assert!(
+            m.starts_at >= before + offset - 1 && m.starts_at <= after + offset,
+            "{fields}: {} not {offset} from now",
+            m.starts_at - before
+        );
+    }
+
+    let windows = db::all_maintenance(&pool).await.unwrap().len();
+    let mut req = post_form(
+        "/maintenance",
+        "component=web&duration_minutes=30&note=x&starts_at=next+tuesday",
+    );
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, body) = send(app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("not valid"), "{body}");
+    assert_eq!(db::all_maintenance(&pool).await.unwrap().len(), windows);
+}
