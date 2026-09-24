@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/kennywillbe/dunlin/compare/v0.1.0...v0.2.0) (2026-09-24)
+
+
+### Features
+
+* add public_url and fix issues found reviewing 0.1.0 ([#13](https://github.com/kennywillbe/dunlin/issues/13)) ([6b0f457](https://github.com/kennywillbe/dunlin/commit/6b0f457438bfc801ea48f029f4b562d7f04a0ad5))
+
+
+### Bug Fixes
+
+* close incidents of removed checks and reload once per save ([#12](https://github.com/kennywillbe/dunlin/issues/12)) ([d3cd072](https://github.com/kennywillbe/dunlin/commit/d3cd0722088cb18fe5a890a8f9a76b8db52ff58f))
+
 ## 0.1.0 (2026-09-23)
 
 First public version. HTTP, TCP, systemd, Docker, resource and heartbeat
