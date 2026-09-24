@@ -1563,6 +1563,9 @@ async fn resolve_incident(
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
+/// Longest maintenance window, and furthest start, that the form accepts.
+const MAX_MAINTENANCE_SECS: i64 = 366 * 86_400;
+
 #[derive(Deserialize)]
 struct MaintenanceForm {
     #[serde(default)]
@@ -1584,8 +1587,14 @@ async fn start_maintenance(
         return r;
     }
     let now = crate::now_ts();
-    let duration = form.duration_minutes.max(1) * 60;
-    let starts = now + form.starts_in_seconds.unwrap_or(0);
+    // Clamped so a typo cannot overflow the timestamps; a window longer than
+    // a year, or starting further out, is not a maintenance window.
+    let duration = form.duration_minutes.clamp(1, MAX_MAINTENANCE_SECS / 60) * 60;
+    let starts = now
+        + form
+            .starts_in_seconds
+            .unwrap_or(0)
+            .clamp(0, MAX_MAINTENANCE_SECS);
     if let Err(e) = db::create_maintenance(
         &state.pool,
         &form.component,
