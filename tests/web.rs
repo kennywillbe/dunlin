@@ -1347,3 +1347,285 @@ async fn protect_read_locks_prometheus() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("# TYPE dunlin_build_info gauge"));
 }
+
+const API_TOKEN: &str = "test-api-token";
+
+/// Config with one API key for `API_TOKEN`.
+fn api_config(protect_read: bool) -> Arc<Config> {
+    let extra = format!(
+        "[[api_keys]]\nname = \"grafana\"\nhash = \"{}\"\n",
+        dunlin::auth::token_hash(API_TOKEN)
+    );
+    test_config_with(protect_read, &extra, std::path::Path::new("."))
+}
+
+fn json(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+}
+
+#[tokio::test]
+async fn api_status_shape() {
+    let (state, pool) = state_from(api_config(false)).await;
+    record_results(&pool, "c1", 199, 1).await;
+    let now = dunlin::now_ts();
+    db::create_incident(
+        &pool,
+        "web",
+        "Slow",
+        dunlin::models::State::Degraded,
+        dunlin::models::IncidentState::Investigating,
+        false,
+        now - 120,
+    )
+    .await
+    .unwrap();
+
+    let (status, headers, body) = send(app(state), get("/api/v1/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[CONTENT_TYPE], "application/json");
+    assert_eq!(headers["cache-control"], "no-cache");
+    let v = json(&body);
+    assert_eq!(v["status"], "degraded");
+    assert!((v["generated_at"].as_i64().unwrap() - now).abs() < 5);
+    assert_eq!(
+        v["components"],
+        serde_json::json!([{
+            "id": "web",
+            "name": "Website",
+            "group": "g",
+            "state": "degraded",
+            "since": now - 120,
+            "uptime_90d": 99.5,
+        }])
+    );
+}
+
+#[tokio::test]
+async fn api_status_without_data_uses_nulls() {
+    let extra = "[[components]]\nid = \"manual\"\nname = \"Manual\"\n";
+    let (state, _pool) =
+        state_from(test_config_with(false, extra, std::path::Path::new("."))).await;
+    let (_, _, body) = send(app(state), get("/api/v1/status")).await;
+    let v = json(&body);
+    assert_eq!(v["status"], "operational");
+    let manual = &v["components"][1];
+    assert_eq!(manual["id"], "manual");
+    assert!(manual["group"].is_null());
+    assert!(manual["since"].is_null());
+    assert!(manual["uptime_90d"].is_null());
+}
+
+#[tokio::test]
+async fn api_incidents_list_and_detail() {
+    use dunlin::models::{IncidentState, State};
+    let (state, pool) = state(false).await;
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let id = db::create_incident(
+            &pool,
+            "web",
+            &format!("Incident {i}"),
+            State::PartialOutage,
+            IncidentState::Investigating,
+            i == 0,
+            1000 + i,
+        )
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    db::add_update(
+        &pool,
+        ids[0],
+        1000,
+        IncidentState::Investigating,
+        "looking",
+        true,
+    )
+    .await
+    .unwrap();
+    db::add_update(
+        &pool,
+        ids[0],
+        1100,
+        IncidentState::Identified,
+        "found it",
+        false,
+    )
+    .await
+    .unwrap();
+    db::resolve_incident(&pool, ids[0], 1200).await.unwrap();
+    let app = app(state);
+
+    let (status, headers, body) = send(app.clone(), get("/api/v1/incidents")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-cache");
+    let list = json(&body);
+    let titles: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["Incident 2", "Incident 1", "Incident 0"]);
+    assert_eq!(
+        list[2],
+        serde_json::json!({
+            "id": ids[0],
+            "title": "Incident 0",
+            "component": "web",
+            "state": "resolved",
+            "impact": "partial_outage",
+            "created_at": 1000,
+            "resolved_at": 1200,
+            "auto": true,
+        })
+    );
+    assert!(list[0]["resolved_at"].is_null());
+
+    let (status, _, body) = send(app.clone(), get(&format!("/api/v1/incidents/{}", ids[0]))).await;
+    assert_eq!(status, StatusCode::OK);
+    let one = json(&body);
+    assert_eq!(one["title"], "Incident 0");
+    assert_eq!(
+        one["updates"],
+        serde_json::json!([
+            {"state": "identified", "message": "found it", "created_at": 1100},
+            {"state": "investigating", "message": "looking", "created_at": 1000},
+        ])
+    );
+
+    for uri in ["/api/v1/incidents/999", "/api/v1/incidents/abc"] {
+        let (status, headers, body) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+        assert_eq!(json(&body), serde_json::json!({"error": "not found"}));
+    }
+}
+
+#[tokio::test]
+async fn api_incidents_limit_is_clamped() {
+    let (state, pool) = state(false).await;
+    for i in 0..105 {
+        db::create_incident(
+            &pool,
+            "web",
+            &format!("n{i}"),
+            dunlin::models::State::MajorOutage,
+            dunlin::models::IncidentState::Investigating,
+            false,
+            i,
+        )
+        .await
+        .unwrap();
+    }
+    let app = app(state);
+    for (uri, want) in [
+        ("/api/v1/incidents", 20),
+        ("/api/v1/incidents?limit=5", 5),
+        ("/api/v1/incidents?limit=1000", 100),
+        ("/api/v1/incidents?limit=0", 1),
+        ("/api/v1/incidents?limit=-3", 1),
+    ] {
+        let (status, _, body) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(json(&body).as_array().unwrap().len(), want, "{uri}");
+    }
+}
+
+fn with_header(uri: &str, name: &str, value: &str) -> Request<Body> {
+    let mut req = get(uri);
+    req.headers_mut().insert(
+        name.parse::<axum::http::HeaderName>().unwrap(),
+        value.parse().unwrap(),
+    );
+    req
+}
+
+#[tokio::test]
+async fn protect_read_api_needs_a_key_or_session() {
+    let (state, _pool) = state_from(api_config(true)).await;
+    let app = app(state);
+    let api = [
+        "/api/v1/status",
+        "/api/v1/incidents",
+        "/api/v1/incidents/1",
+        "/api/metrics",
+    ];
+    let browser = [
+        "/badge/web.svg",
+        "/badge/web/uptime.svg",
+        "/metrics/prometheus",
+    ];
+
+    for uri in api {
+        let (status, headers, body) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+        assert_eq!(headers["www-authenticate"], "Bearer");
+        assert_eq!(json(&body), serde_json::json!({"error": "unauthorized"}));
+    }
+    for uri in browser {
+        let (status, headers, _) = send(app.clone(), get(uri)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(headers["location"], "/login");
+    }
+
+    // A wrong token is treated like none at all.
+    for uri in api {
+        let req = with_header(uri, "authorization", "Bearer not-the-token");
+        assert_eq!(
+            send(app.clone(), req).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{uri}"
+        );
+        let (status, _, _) = send(app.clone(), get(&format!("{uri}?token=nope"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    for uri in browser {
+        let (status, _, _) = send(app.clone(), get(&format!("{uri}?token=nope"))).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{uri}");
+    }
+
+    let ok = |status: StatusCode, uri: &str| {
+        // The incident does not exist, but the request got past the guard.
+        let want = if uri == "/api/v1/incidents/1" {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(status, want, "{uri}");
+    };
+    for uri in api.iter().chain(browser.iter()) {
+        let req = with_header(uri, "authorization", &format!("Bearer {API_TOKEN}"));
+        ok(send(app.clone(), req).await.0, uri);
+        let req = with_header(uri, "authorization", &format!("bearer {API_TOKEN}"));
+        ok(send(app.clone(), req).await.0, uri);
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        ok(
+            send(app.clone(), get(&format!("{uri}{sep}token={API_TOKEN}")))
+                .await
+                .0,
+            uri,
+        );
+    }
+
+    let cookie = login(&app).await;
+    for uri in api.iter().chain(browser.iter()) {
+        let req = with_header(uri, "cookie", &cookie);
+        ok(send(app.clone(), req).await.0, uri);
+    }
+}
+
+#[tokio::test]
+async fn public_api_ignores_keys() {
+    let (state, _pool) = state_from(api_config(false)).await;
+    let app = app(state);
+    for uri in ["/api/v1/status", "/badge/web.svg", "/metrics/prometheus"] {
+        assert_eq!(send(app.clone(), get(uri)).await.0, StatusCode::OK, "{uri}");
+        let req = with_header(uri, "authorization", "Bearer wrong");
+        assert_eq!(send(app.clone(), req).await.0, StatusCode::OK, "{uri}");
+        let req = with_header(uri, "authorization", &format!("Bearer {API_TOKEN}"));
+        assert_eq!(send(app.clone(), req).await.0, StatusCode::OK, "{uri}");
+    }
+}

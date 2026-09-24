@@ -121,6 +121,12 @@ Authorization = "Bearer REPLACE"
 # token = "REPLACE"                # application API token
 # user = "REPLACE"                 # user or group key
 
+# API keys for the JSON API, badges and Prometheus when protect_read = true.
+# `dunlin hash-token` prints a token and its hash; only the hash goes here.
+# [[api_keys]]
+# name = "grafana"                 # shown in logs
+# hash = "REPLACE"                 # sha256 of the token, lowercase hex
+
 # Groups organise components on the status page.
 [[groups]]
 id = "core"

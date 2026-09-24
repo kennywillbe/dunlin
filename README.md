@@ -28,7 +28,8 @@ Licensed under MIT OR Apache-2.0.
   check latency; a Prometheus endpoint with the current values.
 - **Web**: read pages are public by default; incidents and maintenance are
   managed on `/manage`, and every write action needs the password (argon2, per-IP login rate limit, CSRF check). `protect_read = true`
-  puts the read pages behind the password too.
+  puts the read pages behind the password too. A read-only JSON API, with
+  API keys for when reads are protected.
 - **Config** is a TOML file that is reloaded on change; an invalid new file is
   logged and the running configuration is kept. `listen`, `data_dir`,
   `db_path` and `docker.socket` need a restart; a change to them is logged.
@@ -77,9 +78,9 @@ for `/`) and point `mount` at it.
 
 `dunlin.example.toml` is the reference for every key: listen address, data
 directory, proc root, Docker socket, systemd toggle, password hash and
-`protect_read`, notifiers, daily summary, retention, groups, components and all
-check types with their intervals and thresholds. `dunlin check-config --config
-<path>` validates a file and prints every problem at once.
+`protect_read`, API keys, notifiers, daily summary, retention, groups,
+components and all check types with their intervals and thresholds. `dunlin
+check-config --config <path>` validates a file and prints every problem at once.
 
 Durations accept `30s`, `5m`, `1h30m`, `7d` or a bare number of seconds.
 
@@ -188,19 +189,22 @@ state and 90-day uptime as the status page:
 ![Website](https://status.example.org/badge/homepage.svg)
 ```
 
-`<component>` is the component `id`. With `protect_read = true` badges need a
-logged-in session, like every other read page.
+`<component>` is the component `id`. With `protect_read = true` badges need an
+[API key](#api) (`?token=`) or a logged-in session.
 
 ## Prometheus
 
 `/metrics/prometheus` serves the current values in the Prometheus text format.
-It is public unless `protect_read = true`, in which case it needs a logged-in
-session like the other read pages.
+It is public unless `protect_read = true`, in which case it needs an
+[API key](#api) or a logged-in session.
 
 ```yaml
 scrape_configs:
   - job_name: dunlin
     metrics_path: /metrics/prometheus
+    # Only with protect_read = true: a token from `dunlin hash-token`.
+    # authorization:
+    #   credentials_file: /etc/prometheus/dunlin-token
     static_configs:
       - targets: ["status.example.org:8080"]
 ```
@@ -226,11 +230,47 @@ Host and container values older than 3 minutes (three collector rounds) are
 left out, so a removed container or a stalled collector shows as missing
 rather than frozen.
 
+## API
+
+A read-only JSON API under `/api/v1`, sent with `Cache-Control: no-cache`.
+States are the snake_case names from the webhook payload and times are Unix
+seconds.
+
+- `GET /api/v1/status`: `status` (the worst component state), `generated_at`
+  and `components`, each with `id`, `name`, `group`, `state`, `since` (when
+  its oldest open incident started, or `null`) and `uptime_90d` (the status
+  page's percentage, or `null` without data).
+- `GET /api/v1/incidents?limit=N`: newest first, open and resolved; `limit`
+  defaults to 20, at most 100. Each has `id`, `title`, `component` (empty for
+  all components), `state`, `impact`, `created_at`, `resolved_at` and `auto`.
+- `GET /api/v1/incidents/<id>`: one incident plus its `updates` (`state`,
+  `message`, `created_at`), newest first.
+
+With `protect_read = false` the API, badges and `/metrics/prometheus` are
+public. With `protect_read = true` they need an API key or a logged-in session;
+the API answers `401 {"error":"unauthorized"}` otherwise. Make a key with
+`dunlin hash-token` and put only the hash in the config:
+
+```toml
+[[api_keys]]
+name = "grafana"   # shown in logs
+hash = "<hash printed by dunlin hash-token>"
+```
+
+Send the token as `Authorization: Bearer <token>`, or as `?token=<token>` for
+clients that cannot set headers (badge images, some scrapers). A token in the
+URL can end up in proxy and access logs, so prefer the header where you can.
+
+```sh
+curl -H "Authorization: Bearer $DUNLIN_TOKEN" https://status.example.org/api/v1/status
+```
+
 ## CLI
 
 ```
 dunlin [--config <path>]     run the server (default: dunlin.toml)
 dunlin hash-password         read a password on stdin, print an argon2 hash
+dunlin hash-token            make an API token and print it with its hash
 dunlin check-config          validate the config and exit
 dunlin --version
 ```

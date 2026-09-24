@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, WWW_AUTHENTICATE,
+};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -59,6 +61,9 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_page))
         .route("/metrics/prometheus", get(prometheus))
         .route("/api/metrics", get(api_metrics))
+        .route("/api/v1/status", get(api_status))
+        .route("/api/v1/incidents", get(api_incidents))
+        .route("/api/v1/incidents/{id}", get(api_incident))
         .route("/incidents", get(incidents_page))
         .route("/incidents/{id}", get(incident_page))
         .route("/manage", get(manage_page))
@@ -158,6 +163,84 @@ async fn write_guard(state: &AppState, headers: &HeaderMap, jar: &CookieJar) -> 
         return Some(Redirect::to("/login").into_response());
     }
     None
+}
+
+/// The token a request presents, from `Authorization: Bearer` or `?token=`.
+/// The query form is for clients that cannot set headers, such as an image
+/// tag or a scraper.
+fn presented_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim().to_string());
+    bearer.or_else(|| {
+        url::form_urlencoded::parse(uri.query()?.as_bytes())
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.into_owned())
+    })
+}
+
+/// Name of the configured API key whose token the request presents.
+fn api_key_name(cfg: &Config, headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let token = presented_token(headers, uri)?;
+    let hash = auth::token_hash(&token);
+    // Every key is compared, so the time taken does not say which one matched.
+    let mut found = None;
+    for key in &cfg.api_keys {
+        if auth::secret_eq(&key.hash, &hash) && found.is_none() {
+            found = Some(key.name.clone());
+        }
+    }
+    found
+}
+
+/// Whether a request may read data. Under `protect_read` that takes an API
+/// key or a session; otherwise everything is public and a key is not needed.
+async fn read_allowed(state: &AppState, headers: &HeaderMap, uri: &Uri, jar: &CookieJar) -> bool {
+    let cfg = state.cfg();
+    if !cfg.web.protect_read {
+        return true;
+    }
+    if let Some(name) = api_key_name(&cfg, headers, uri) {
+        tracing::debug!(api_key = %name, path = %uri.path(), "read with api key");
+        return true;
+    }
+    is_logged_in(state, jar).await
+}
+
+fn api_json(status: StatusCode, body: serde_json::Value) -> Response {
+    (
+        status,
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn api_error(status: StatusCode, error: &str) -> Response {
+    api_json(status, serde_json::json!({ "error": error }))
+}
+
+/// Access check for the JSON API. Clients are programs, so they get a 401
+/// they can act on rather than a redirect to the login form.
+async fn api_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    jar: &CookieJar,
+) -> Option<Response> {
+    if read_allowed(state, headers, uri, jar).await {
+        return None;
+    }
+    let mut resp = api_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    resp.headers_mut()
+        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    Some(resp)
 }
 
 /// Display name for a component id; incidents and maintenance store ids.
@@ -933,10 +1016,12 @@ struct MetricsQuery {
 
 async fn api_metrics(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
     jar: CookieJar,
     Query(q): Query<MetricsQuery>,
 ) -> Response {
-    if let Some(r) = read_guard(&state, &jar).await {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
         return r;
     }
     let now = crate::now_ts();
@@ -1230,10 +1315,19 @@ const NOSNIFF: (HeaderName, HeaderValue) = (
 );
 
 /// Access check for badges. Badges are embedded where no session cookie is
-/// sent (READMEs, other dashboards), so this is where API keys will be
-/// accepted under `protect_read`; until then it is the read-page guard.
-async fn badge_guard(state: &AppState, jar: &CookieJar) -> Option<Response> {
-    read_guard(state, jar).await
+/// sent (READMEs, other dashboards), so an API key works too. Without either
+/// they behave like any read page.
+async fn badge_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    jar: &CookieJar,
+) -> Option<Response> {
+    if read_allowed(state, headers, uri, jar).await {
+        None
+    } else {
+        Some(Redirect::to("/login").into_response())
+    }
 }
 
 enum BadgeFormat {
@@ -1296,9 +1390,11 @@ async fn badge_facts(
 async fn badge(
     State(state): State<AppState>,
     Path(file): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
     jar: CookieJar,
 ) -> Response {
-    if let Some(r) = badge_guard(&state, &jar).await {
+    if let Some(r) = badge_guard(&state, &headers, &uri, &jar).await {
         return r;
     }
     let (id, format) = match file.rsplit_once('.') {
@@ -1322,9 +1418,11 @@ async fn badge(
 async fn uptime_badge(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
     jar: CookieJar,
 ) -> Response {
-    if let Some(r) = badge_guard(&state, &jar).await {
+    if let Some(r) = badge_guard(&state, &headers, &uri, &jar).await {
         return r;
     }
     let cfg = state.cfg();
@@ -1342,6 +1440,143 @@ async fn uptime_badge(
     badge_response(StatusCode::OK, BadgeFormat::Svg, &badge)
 }
 
+fn incident_json(i: &crate::models::Incident) -> serde_json::Value {
+    serde_json::json!({
+        "id": i.id,
+        "title": i.title,
+        "component": i.component,
+        "state": i.state.as_str(),
+        "impact": i.impact.as_str(),
+        "created_at": i.created_at,
+        "resolved_at": i.resolved_at,
+        "auto": i.auto,
+    })
+}
+
+/// `/api/v1/status`: every component as the status page shows it.
+async fn api_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let cfg = state.cfg();
+    let now = crate::now_ts();
+    let (active, windows) = match tokio::try_join!(
+        db::active_incidents(&state.pool),
+        db::current_and_upcoming_maintenance(&state.pool, now),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "api status failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, cfg.tz());
+    let from = strip.first().map_or(now, |d| d.start);
+    let mut states = Vec::new();
+    let mut components = Vec::new();
+    for comp in &cfg.components {
+        let c = component_now(&state.pool, &cfg, comp, &windows, &active, from, now).await;
+        states.push(c.state);
+        components.push(serde_json::json!({
+            "id": comp.id,
+            "name": comp.name,
+            "group": comp.group,
+            "state": c.state.as_str(),
+            "since": c.since,
+            // The figure the status page prints, as a number.
+            "uptime_90d": c.uptime_90.and_then(|p| format_pct(p).parse::<f64>().ok()),
+        }));
+    }
+    api_json(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": status::overall(states).as_str(),
+            "components": components,
+            "generated_at": now,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct IncidentsQuery {
+    limit: Option<i64>,
+}
+
+/// `/api/v1/incidents`: newest first, open and resolved.
+async fn api_incidents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Query(q): Query<IncidentsQuery>,
+) -> Response {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    match db::recent_incidents(&state.pool, limit).await {
+        Ok(list) => api_json(
+            StatusCode::OK,
+            serde_json::Value::Array(list.iter().map(incident_json).collect()),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "api incidents failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// `/api/v1/incidents/{id}`: one incident with its updates, newest first.
+async fn api_incident(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let Ok(id) = id.parse::<i64>() else {
+        return api_error(StatusCode::NOT_FOUND, "not found");
+    };
+    let found = match db::incident(&state.pool, id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::error!(error = %e, "api incident failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    let Some(incident) = found else {
+        return api_error(StatusCode::NOT_FOUND, "not found");
+    };
+    let updates = match db::incident_updates(&state.pool, id).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!(error = %e, "api incident updates failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    let mut body = incident_json(&incident);
+    body["updates"] = updates
+        .iter()
+        .rev()
+        .map(|u| {
+            serde_json::json!({
+                "state": u.state.as_str(),
+                "message": u.message,
+                "created_at": u.ts,
+            })
+        })
+        .collect();
+    api_json(StatusCode::OK, body)
+}
+
 /// Newest sample a scrape still exports. The collector writes every 60 s, so
 /// three missed rounds mean the source (a removed container, a stopped
 /// collector) is gone rather than late.
@@ -1349,15 +1584,25 @@ const SCRAPE_FRESH_SECS: i64 = 180;
 
 /// Access check for the Prometheus endpoint. Scrapers send no session cookie
 /// either, so this goes through the same hook that API keys will use.
-async fn scrape_guard(state: &AppState, jar: &CookieJar) -> Option<Response> {
-    badge_guard(state, jar).await
+async fn scrape_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    jar: &CookieJar,
+) -> Option<Response> {
+    badge_guard(state, headers, uri, jar).await
 }
 
 /// `/metrics/prometheus`: current checks, components, host and containers.
-async fn prometheus(State(state): State<AppState>, jar: CookieJar) -> Response {
+async fn prometheus(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
     use crate::prometheus::Family;
 
-    if let Some(r) = scrape_guard(&state, &jar).await {
+    if let Some(r) = scrape_guard(&state, &headers, &uri, &jar).await {
         return r;
     }
     let cfg = state.cfg();

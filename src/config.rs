@@ -293,6 +293,16 @@ pub enum NotifierConfig {
     },
 }
 
+/// `[[api_keys]]`: read access for scripts, dashboards and scrapers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyConfig {
+    /// Shown in logs, never the token.
+    pub name: String,
+    /// SHA-256 of the token, lowercase hex, so the config holds no secret.
+    pub hash: String,
+}
+
 /// `[[groups]]`
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -463,6 +473,8 @@ pub struct Config {
     #[serde(default)]
     pub notifiers: Vec<NotifierConfig>,
     #[serde(default)]
+    pub api_keys: Vec<ApiKeyConfig>,
+    #[serde(default)]
     pub groups: Vec<GroupConfig>,
     #[serde(default)]
     pub components: Vec<ComponentConfig>,
@@ -499,6 +511,7 @@ impl Default for Config {
             docker: DockerConfig::default(),
             systemd: SystemdConfig::default(),
             notifiers: Vec::new(),
+            api_keys: Vec::new(),
             groups: Vec::new(),
             components: Vec::new(),
             checks: Vec::new(),
@@ -734,6 +747,25 @@ pub fn validate(cfg: &Config) -> Result<()> {
                     errs.push("pushover notifier needs token and user".to_string());
                 }
             }
+        }
+    }
+
+    let mut key_names = HashSet::new();
+    for k in &cfg.api_keys {
+        if k.name.trim().is_empty() {
+            errs.push("api_keys entries need a name".to_string());
+        } else if !key_names.insert(k.name.as_str()) {
+            errs.push(format!("duplicate api key name {:?}", k.name));
+        }
+        let hex_ok = k.hash.len() == 64
+            && k.hash
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !hex_ok {
+            errs.push(format!(
+                "api key {:?} hash must be 64 lowercase hex characters (run `dunlin hash-token`)",
+                k.name
+            ));
         }
     }
 
@@ -1008,6 +1040,32 @@ user = "me"
         // A missing required key is a parse error rather than a validation one.
         assert!(parse_str(&with("type = \"pushover\"\ntoken = \"t\"")).is_err());
         assert!(parse_str(&with("type = \"ntfy\"\nurl = \"https://ntfy.sh\"")).is_err());
+    }
+
+    #[test]
+    fn api_keys_validated() {
+        let hash = "a".repeat(64);
+        let key = |name: &str, hash: &str| {
+            format!("[[api_keys]]\nname = \"{name}\"\nhash = \"{hash}\"\n")
+        };
+        let with = |keys: String| format!("{}\n{keys}", base_with_real_hash());
+
+        let cfg = parse_str(&with(key("grafana", &hash) + &key("ci", &"0".repeat(64)))).unwrap();
+        assert_eq!(cfg.api_keys.len(), 2);
+        assert_eq!(cfg.api_keys[0].name, "grafana");
+
+        let cases = [
+            (key(" ", &hash), "need a name"),
+            (key("a", &hash) + &key("a", &hash), "duplicate api key name"),
+            (key("a", &"A".repeat(64)), "64 lowercase hex"),
+            (key("a", &"a".repeat(63)), "64 lowercase hex"),
+            (key("a", &"g".repeat(64)), "64 lowercase hex"),
+        ];
+        for (keys, want) in cases {
+            let err = parse_str(&with(keys.clone())).unwrap_err().to_string();
+            assert!(err.contains(want), "{keys}: {err}");
+        }
+        assert!(parse_str(&with("[[api_keys]]\nname = \"a\"\n".into())).is_err());
     }
 
     #[test]

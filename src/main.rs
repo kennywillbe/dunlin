@@ -10,6 +10,7 @@ dunlin — self-hosted uptime and server monitoring
 USAGE:
     dunlin [--config <path>]                run the server (default config: dunlin.toml)
     dunlin hash-password                    read a password on stdin, print an argon2 hash
+    dunlin hash-token                       make an API token and print it with its hash
     dunlin check-config [--config <path>]   validate a config and exit
     dunlin --version
     dunlin --help
@@ -84,6 +85,14 @@ async fn run() -> Result<()> {
             let password = input.trim_end_matches(['\n', '\r']);
             let hash = dunlin::auth::hash_password(password)?;
             println!("{hash}");
+            Ok(())
+        }
+        Some("hash-token") => {
+            let token = dunlin::auth::random_token();
+            println!("token: {token}");
+            println!("hash:  {}", dunlin::auth::token_hash(&token));
+            // On stderr so scripts can read stdout as two plain lines.
+            eprintln!("Put only the hash in [[api_keys]]; the token is shown once and not stored.");
             Ok(())
         }
         Some("check-config") => {
