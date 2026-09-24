@@ -210,9 +210,6 @@ async fn incident_views(
 /// How many days of history the status page lists, as on Statuspage.
 const PAST_DAYS: usize = 14;
 
-/// Window of the tick strips.
-const STRIP_DAYS: usize = 90;
-
 fn fmt_every(secs: u64) -> String {
     if secs < 120 || !secs.is_multiple_of(60) {
         format!("{secs} s")
@@ -263,7 +260,7 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
         .unwrap_or_default();
     let active = db::active_incidents(&state.pool).await.unwrap_or_default();
     let tz = cfg.tz();
-    let strip = crate::days::last_days(now, STRIP_DAYS, tz);
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, tz);
     let strip_from = strip.first().map_or(now, |d| d.start);
     let history = History {
         days: strip,

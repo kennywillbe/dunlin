@@ -196,6 +196,14 @@ pub async fn insert_check_result(pool: &Pool, r: &CheckResult) -> Result<()> {
     Ok(())
 }
 
+pub async fn prune_check_results_before(pool: &Pool, cutoff: i64) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM check_results WHERE ts < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn last_check_result(pool: &Pool, check_id: &str) -> Result<Option<CheckResult>> {
     let row = sqlx::query(
         "SELECT ts, check_id, ok, degraded, latency_ms, message FROM check_results

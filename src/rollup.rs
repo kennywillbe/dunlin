@@ -6,6 +6,13 @@ use crate::db::{self, Pool};
 
 const LAST_ROLLUP: &str = "last_rollup";
 
+/// Days of probe results to keep: as long as the hourly aggregates, but never
+/// less than the status page's strip, plus a day so the oldest local day is
+/// still whole in any timezone.
+fn result_days(hourly_days: u32) -> i64 {
+    hourly_days.max(crate::days::STRIP_DAYS as u32) as i64 + 1
+}
+
 /// Aggregate completed hours into `hourly`, then drop data past retention.
 ///
 /// Idempotent: the range starts at the last recorded rollup boundary, so a
@@ -25,6 +32,7 @@ pub async fn run_once(pool: &Pool, now: i64, raw_days: u32, hourly_days: u32) ->
 
     db::prune_samples_before(pool, now - raw_days as i64 * 86_400).await?;
     db::prune_hourly_before(pool, now - hourly_days as i64 * 86_400).await?;
+    db::prune_check_results_before(pool, now - result_days(hourly_days) * 86_400).await?;
     db::prune_sessions(pool, now).await?;
     Ok(())
 }
@@ -94,6 +102,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(h2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn prunes_check_results_past_the_strip() {
+        let pool = db::connect_memory().await.unwrap();
+        let now: i64 = 400 * 86_400;
+        let result = |ts| crate::models::CheckResult {
+            ts,
+            check_id: "c".into(),
+            ok: true,
+            degraded: false,
+            latency_ms: None,
+            message: None,
+        };
+        for ts in [now - 120 * 86_400, now - 91 * 86_400 + 60, now - 60] {
+            db::insert_check_result(&pool, &result(ts)).await.unwrap();
+        }
+        // hourly_days below the strip still keeps the strip's 90 days.
+        run_once(&pool, now, 7, 30).await.unwrap();
+        let (total, _) = db::uptime_between(&pool, "c", 0, now).await.unwrap();
+        assert_eq!(total, 2);
+
+        // A longer hourly retention keeps results as long.
+        db::insert_check_result(&pool, &result(now - 150 * 86_400))
+            .await
+            .unwrap();
+        run_once(&pool, now, 7, 200).await.unwrap();
+        let (total, _) = db::uptime_between(&pool, "c", 0, now).await.unwrap();
+        assert_eq!(total, 3);
     }
 
     #[tokio::test]
