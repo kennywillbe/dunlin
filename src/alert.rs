@@ -150,6 +150,19 @@ impl AlertEngine {
             now,
             muted,
         } = input;
+        // An operator may have resolved this check's incident on /manage. The
+        // machine would otherwise keep reminding about a closed incident, never
+        // open a new one, and resolve the closed one a second time on recovery.
+        // Starting over means a failure that persists opens a fresh incident.
+        if let Some(id) = self.machines.get(&check.id).and_then(|m| m.incident_id) {
+            let closed = db::incident(pool, id)
+                .await?
+                .is_none_or(|i| i.resolved_at.is_some());
+            if closed {
+                self.machines
+                    .insert(check.id.clone(), CheckMachine::default());
+            }
+        }
         let transition = {
             let machine = self.machines.entry(check.id.clone()).or_default();
             machine.on_result(check, ok, now)
@@ -445,6 +458,53 @@ mod tests {
         let inc = db::incident(&pool, id).await.unwrap().unwrap();
         assert!(inc.resolved_at.is_some());
         assert_eq!(rec.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_resolve_resets_the_machine() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        let c = check();
+
+        for t in 0..3 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let first = db::active_incidents(&pool).await.unwrap()[0].id;
+        assert_eq!(rec.count(), 1);
+
+        // Resolved by hand while the check still fails.
+        db::resolve_incident(&pool, first, 5).await.unwrap();
+
+        // No reminder about the closed incident, even past the interval...
+        feed(&mut engine, &pool, &c, false, Some("boom"), 200, false)
+            .await
+            .unwrap();
+        assert_eq!(rec.count(), 1);
+        assert!(db::active_incidents(&pool).await.unwrap().is_empty());
+
+        // ...and a failure that goes on opens a new incident.
+        for t in 201..203 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let active = db::active_incidents(&pool).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_ne!(active[0].id, first);
+
+        // Recovery closes the new one and leaves the old one as it was.
+        for t in 300..302 {
+            feed(&mut engine, &pool, &c, true, None, t, false)
+                .await
+                .unwrap();
+        }
+        assert!(db::active_incidents(&pool).await.unwrap().is_empty());
+        let old = db::incident(&pool, first).await.unwrap().unwrap();
+        assert_eq!(old.resolved_at, Some(5));
+        assert_eq!(db::incident_updates(&pool, first).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
