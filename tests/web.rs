@@ -894,3 +894,27 @@ async fn incident_on_all_components_shows_on_every_component() {
     assert!(!body.contains("svc s-operational"), "{body}");
     assert!(body.contains("bar s-major_outage today"), "{body}");
 }
+
+#[tokio::test]
+async fn huge_maintenance_duration_is_clamped() {
+    let (state, pool) = state(false).await;
+    let app = app(state);
+    let cookie = login(&app).await;
+    let mut req = post_form(
+        "/maintenance",
+        &format!(
+            "component=web&note=x&duration_minutes={}&starts_in_seconds=-5",
+            i64::MAX
+        ),
+    );
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let now = dunlin::now_ts();
+    let windows = db::active_maintenance(&pool, now).await.unwrap();
+    assert_eq!(windows.len(), 1);
+    let w = &windows[0];
+    assert!(w.starts_at >= now - 5, "{w:?}");
+    assert!(w.ends_at <= now + 366 * 86_400 + 5, "{w:?}");
+}
