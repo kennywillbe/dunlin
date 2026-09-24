@@ -1,4 +1,4 @@
-//! CLI tests: `hash-password` and `check-config`.
+//! CLI tests: `hash-password`, `hash-token` and `check-config`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -119,4 +119,33 @@ fn no_arguments_runs_the_server_with_dunlin_toml() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("dunlin.toml"), "{err}");
+}
+
+#[test]
+fn hash_token_prints_a_token_and_its_hash() {
+    let out = bin().arg("hash-token").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    let token = lines[0].strip_prefix("token: ").expect(&stdout);
+    let hash = lines[1].strip_prefix("hash:  ").expect(&stdout);
+    let is_hex64 = |s: &str| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    };
+    assert!(is_hex64(token), "{token}");
+    assert!(is_hex64(hash), "{hash}");
+    use sha2::Digest;
+    assert_eq!(hex::encode(sha2::Sha256::digest(token.as_bytes())), hash);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[[api_keys]]"));
+
+    // A fresh token every time.
+    let again = bin().arg("hash-token").output().unwrap();
+    assert_ne!(String::from_utf8(again.stdout).unwrap(), stdout);
 }

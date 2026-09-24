@@ -153,6 +153,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let notifiers = Arc::new(MultiNotifier::new(build_notifiers(&cfg, &http)));
 
     let mut engine = AlertEngine::new(notifiers.clone(), cfg.public_url.clone());
+    engine.set_subscriptions(cfg.clone());
     engine.bootstrap(&pool, &cfg).await?;
     let engine = Arc::new(Mutex::new(engine));
 
@@ -174,6 +175,23 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         http.clone(),
     ));
     tokio::spawn(rollup_loop(pool.clone(), config_rx.clone()));
+    state
+        .channels
+        .replace(crate::subscriptions::dispatch::build_channels(&cfg));
+    tokio::spawn(crate::subscriptions::dispatch::dispatcher_loop(
+        pool.clone(),
+        config_rx.clone(),
+        state.channels.clone(),
+    ));
+    tokio::spawn(crate::subscriptions::telegram::poll_loop(
+        pool.clone(),
+        config_rx.clone(),
+    ));
+    tokio::spawn(crate::subscriptions::dispatch::channel_reload_loop(
+        config_rx.clone(),
+        state.channels.clone(),
+        cfg.subscriptions.clone(),
+    ));
     tokio::spawn(summary_loop(
         pool.clone(),
         config_rx.clone(),
@@ -466,9 +484,10 @@ pub async fn prober_loop(
             let _ = db::insert_samples(&pool, &check_samples(check, &outcome, now)).await;
 
             let component = cfg.incident_component(&check.id);
-            let muted = maintenance.iter().any(|m| m.covers(&component, now));
+            let muted = muted(&maintenance, &component, now);
             let mut engine = engine.lock().await;
             engine.set_public_url(cfg.public_url.clone());
+            engine.set_subscriptions(cfg.clone());
             if let Err(e) = engine
                 .handle(
                     &pool,
@@ -487,6 +506,12 @@ pub async fn prober_loop(
             }
         }
     }
+}
+
+/// Whether a window mutes alerts for `component` at `now`. A planned window
+/// is not muting yet: only one that has started covers the component.
+fn muted(windows: &[crate::models::Maintenance], component: &str, now: i64) -> bool {
+    windows.iter().any(|m| m.covers(component, now))
 }
 
 /// Drop per-check timing of checks no longer in `cfg`. A heartbeat removed and
@@ -782,6 +807,25 @@ mod tests {
         };
         let out = evaluate(&docker, &env).await.unwrap();
         assert!(!out.ok, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn planned_maintenance_mutes_only_once_started() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let now = 1_000_000;
+        db::create_maintenance(&pool, "web", "", now + 600, now + 1200, now)
+            .await
+            .unwrap();
+        // The probe loop fetches windows this way before every round.
+        let at = |t: i64| {
+            let pool = pool.clone();
+            async move { db::active_maintenance(&pool, t).await.unwrap() }
+        };
+        assert!(!muted(&at(now).await, "web", now));
+        assert!(!muted(&at(now + 599).await, "web", now + 599));
+        assert!(muted(&at(now + 600).await, "web", now + 600));
+        assert!(!muted(&at(now + 600).await, "db", now + 600));
+        assert!(!muted(&at(now + 1200).await, "web", now + 1200));
     }
 
     #[tokio::test]

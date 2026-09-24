@@ -43,6 +43,30 @@ pub fn token_hash(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// HMAC-SHA256 (RFC 2104), for tokens that are derived rather than stored.
+/// A few lines over `sha2` instead of another crate; the tests pin it to the
+/// RFC 4231 vectors.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(inner.finalize());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer.finalize());
+    out
+}
+
 /// Constant-time comparison of a configured secret against a supplied value.
 pub fn secret_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
@@ -73,6 +97,27 @@ mod tests {
         let h = hash_password("correcthorsebattery").unwrap();
         assert!(h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{h}");
         assert!(PasswordHash::new(&h).is_ok());
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        let h = |key: &[u8], msg: &[u8]| hex::encode(hmac_sha256(key, msg));
+        assert_eq!(
+            h(&[0x0b; 20], b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            h(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Case 6: a key longer than the block is hashed first.
+        assert_eq!(
+            h(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
     }
 
     #[test]

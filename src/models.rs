@@ -34,6 +34,19 @@ impl State {
         }
     }
 
+    /// Colour for notifications and badges, taken from the status page
+    /// palette. Operational has no colour there (it is the calm default), so
+    /// a green stands in.
+    pub fn rgb(self) -> u32 {
+        match self {
+            State::Operational => 0x2e9e5b,
+            State::Maintenance => 0x2f64d8,
+            State::Degraded => 0xe0a21b,
+            State::PartialOutage => 0xe2461f,
+            State::MajorOutage => 0xb8121d,
+        }
+    }
+
     pub fn from_name(s: &str) -> Option<State> {
         Some(match s {
             "operational" => State::Operational,
@@ -178,6 +191,20 @@ pub struct Notification {
     pub component: String,
     pub state: State,
     pub incident_id: Option<i64>,
+    /// Incident page under `public_url`. `message` already ends with it, so
+    /// channels that show a link on its own can take it back out.
+    pub link: Option<String>,
+}
+
+impl Notification {
+    /// The message without the trailing incident link.
+    pub fn text(&self) -> &str {
+        self.link
+            .as_deref()
+            .and_then(|l| self.message.strip_suffix(l))
+            .map(|m| m.strip_suffix('\n').unwrap_or(m))
+            .unwrap_or(&self.message)
+    }
 }
 
 #[cfg(test)]

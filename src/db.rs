@@ -91,6 +91,29 @@ pub async fn latest_sample(
     Ok(row.map(|r| r.get::<f64, _>("value")))
 }
 
+/// Newest sample of every (metric, key) in `scope` taken at or after `from`,
+/// as (metric, key, value), ordered by metric then key.
+pub async fn latest_samples_since(
+    pool: &Pool,
+    scope: &str,
+    from: i64,
+) -> Result<Vec<(String, String, f64)>> {
+    // SQLite fills bare columns from the row that holds MAX(ts).
+    let rows = sqlx::query(
+        "SELECT metric, key, value, MAX(ts) AS ts FROM samples
+         WHERE scope = ? AND ts >= ?
+         GROUP BY metric, key ORDER BY metric, key",
+    )
+    .bind(scope)
+    .bind(from)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("metric"), r.get("key"), r.get("value")))
+        .collect())
+}
+
 /// Raw samples ordered by time.
 pub async fn series(
     pool: &Pool,

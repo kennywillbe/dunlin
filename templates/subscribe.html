@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Subscribe · {% endblock %}
+{% block content %}
+<section class="plain-page" aria-labelledby="subscribe-title">
+  <h2 id="subscribe-title" class="form-title">Get updates</h2>
+  {% if channels.is_empty() %}
+  <p class="soft">Subscriptions are not available yet.</p>
+  {% else %}
+  <p class="soft">Hear when an incident opens, changes or is resolved. Nothing is sent until you confirm.</p>
+  {% if let Some(e) = error %}<p class="alert" role="alert">{{ e }}</p>{% endif %}
+  <form method="post" action="/subscribe" class="form">
+    <fieldset class="field choices">
+      <legend>Send them by</legend>
+      {% for c in channels %}<label class="choice"><input type="radio" name="channel" value="{{ c.name }}"{% if c.checked %} checked{% endif %} required> {{ c.label }} <span class="soft">— {{ c.hint }}</span></label>
+      {% endfor %}
+    </fieldset>
+    <div class="field">
+      <label for="s-address">Address</label>
+      <input id="s-address" type="text" name="address" value="{{ address }}" autocomplete="off">
+    </div>
+    <fieldset class="field choices">
+      <legend>About</legend>
+      <label class="choice"><input type="checkbox" name="all" value="1"{% if all %} checked{% endif %}> All components</label>
+      {% for c in components %}<label class="choice"><input type="checkbox" name="components" value="{{ c.id }}"{% if c.checked %} checked{% endif %}> {{ c.name }}</label>
+      {% endfor %}
+    </fieldset>
+    <label class="choice"><input type="checkbox" name="maintenance" value="1"{% if maintenance %} checked{% endif %}> Also tell me about maintenance</label>
+    <div class="hp" aria-hidden="true">
+      <label for="s-website">Leave this empty</label>
+      <input id="s-website" type="text" name="website" tabindex="-1" autocomplete="off">
+    </div>
+    <div class="actions"><button class="button primary" type="submit">Subscribe</button></div>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

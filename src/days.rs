@@ -4,7 +4,7 @@
 //! local midnights, so a DST day is 23 or 25 hours long and every instant
 //! falls in exactly one day.
 
-use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, TimeDelta, TimeZone};
+use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Timelike};
 use chrono_tz::Tz;
 
 /// Width of the slots per-day uptime is summed from. Every offset and DST
@@ -84,6 +84,31 @@ pub fn start_of(date: NaiveDate, tz: Tz) -> i64 {
     midnight.and_utc().timestamp()
 }
 
+/// The instant a wall-clock time in `tz` names. A time in the repeated hour
+/// is its earlier instant, as for a day's start. A time in a spring-forward
+/// gap never happened on the clock, so it moves to the first instant after
+/// the gap, when the clock resumes.
+pub fn local_to_ts(local: NaiveDateTime, tz: Tz) -> i64 {
+    if let Some(ts) = earliest(tz, local) {
+        return ts;
+    }
+    // Gaps start and end on a whole minute, so walking whole minutes from
+    // the minute of `local` lands exactly on the first wall time after it.
+    // The two-day bound covers a skipped date, as in `start_of`.
+    let mut t = local
+        .with_second(0)
+        .unwrap_or(local)
+        .with_nanosecond(0)
+        .unwrap_or(local);
+    for _ in 0..2 * 1440 {
+        t += TimeDelta::minutes(1);
+        if let Some(ts) = earliest(tz, t) {
+            return ts;
+        }
+    }
+    local.and_utc().timestamp()
+}
+
 fn earliest(tz: Tz, local: NaiveDateTime) -> Option<i64> {
     match tz.from_local_datetime(&local) {
         LocalResult::Single(t) => Some(t.timestamp()),
@@ -131,6 +156,39 @@ mod tests {
         assert_eq!(day.start, utc(2026, 9, 23, 21, 0));
         assert_eq!(day.end, utc(2026, 9, 24, 21, 0));
         assert_eq!(Day::of(ts, Tz::UTC).date, ymd(2026, 9, 23));
+    }
+
+    #[test]
+    fn local_times_across_dst() {
+        let berlin = chrono_tz::Europe::Berlin;
+        let at = |d: u32, m: u32, h: u32, min: u32, sec: u32| {
+            ymd(2026, m, d).and_hms_opt(h, min, sec).unwrap()
+        };
+        // An ordinary summer time: CEST is UTC+2.
+        assert_eq!(
+            local_to_ts(at(1, 7, 12, 0, 0), berlin),
+            utc(2026, 7, 1, 10, 0)
+        );
+        // 02:00-03:00 on Mar 29 does not exist; the clock resumes at 03:00
+        // CEST, 01:00 UTC.
+        assert_eq!(
+            local_to_ts(at(29, 3, 2, 30, 0), berlin),
+            utc(2026, 3, 29, 1, 0)
+        );
+        assert_eq!(
+            local_to_ts(at(29, 3, 2, 37, 30), berlin),
+            utc(2026, 3, 29, 1, 0)
+        );
+        // 02:30 on Oct 25 happens twice; the first one is still CEST.
+        assert_eq!(
+            local_to_ts(at(25, 10, 2, 30, 0), berlin),
+            utc(2026, 10, 25, 0, 30)
+        );
+        // Istanbul has no DST: UTC+3 all year.
+        assert_eq!(
+            local_to_ts(at(24, 9, 14, 30, 0), chrono_tz::Europe::Istanbul),
+            utc(2026, 9, 24, 11, 30)
+        );
     }
 
     #[test]

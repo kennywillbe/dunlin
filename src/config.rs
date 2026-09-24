@@ -275,6 +275,113 @@ pub enum NotifierConfig {
         #[serde(default)]
         headers: BTreeMap<String, String>,
     },
+    Ntfy {
+        url: String,
+        topic: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    Discord {
+        url: String,
+    },
+    Slack {
+        url: String,
+    },
+    Pushover {
+        token: String,
+        user: String,
+    },
+}
+
+/// `[subscriptions]`: visitors signing up for incident and maintenance news.
+/// The channels they can pick have their own sub-tables.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
+    #[serde(default)]
+    pub webhook: Option<SubscriberWebhookConfig>,
+    #[serde(default)]
+    pub telegram: Option<SubscriberTelegramConfig>,
+}
+
+/// `[subscriptions.telegram]`: a bot visitors start from a link, which then
+/// sends them updates. Best a bot of its own: another program polling the
+/// same bot takes its updates away.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriberTelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// From @BotFather, e.g. `123456:ABC-DEF…`. A secret.
+    pub token: String,
+    /// The bot's @name without the @, for `t.me` links. Asked of Telegram
+    /// (`getMe`) when left out.
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+/// `[subscriptions.webhook]`: visitors give an https URL (Slack, Discord or
+/// any JSON endpoint) that updates are posted to.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriberWebhookConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// How the SMTP connection is encrypted. There is no plaintext option: the
+/// login and every subscriber's address would cross the network readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpTls {
+    /// Plain connection upgraded with STARTTLS, usually port 587.
+    #[default]
+    Starttls,
+    /// TLS from the first byte, usually port 465.
+    Implicit,
+}
+
+/// `[subscriptions.email]`: the SMTP server subscriber mail goes through.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub host: String,
+    /// Defaults by `tls`: 587 for STARTTLS, 465 for implicit TLS.
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub tls: SmtpTls,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Sender, e.g. `Status <status@example.org>`.
+    pub from: String,
+}
+
+impl EmailConfig {
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(match self.tls {
+            SmtpTls::Starttls => 587,
+            SmtpTls::Implicit => 465,
+        })
+    }
+}
+
+/// `[[api_keys]]`: read access for scripts, dashboards and scrapers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyConfig {
+    /// Shown in logs, never the token.
+    pub name: String,
+    /// SHA-256 of the token, lowercase hex, so the config holds no secret.
+    pub hash: String,
 }
 
 /// `[[groups]]`
@@ -447,6 +554,10 @@ pub struct Config {
     #[serde(default)]
     pub notifiers: Vec<NotifierConfig>,
     #[serde(default)]
+    pub api_keys: Vec<ApiKeyConfig>,
+    #[serde(default)]
+    pub subscriptions: SubscriptionsConfig,
+    #[serde(default)]
     pub groups: Vec<GroupConfig>,
     #[serde(default)]
     pub components: Vec<ComponentConfig>,
@@ -483,6 +594,8 @@ impl Default for Config {
             docker: DockerConfig::default(),
             systemd: SystemdConfig::default(),
             notifiers: Vec::new(),
+            api_keys: Vec::new(),
+            subscriptions: SubscriptionsConfig::default(),
             groups: Vec::new(),
             components: Vec::new(),
             checks: Vec::new(),
@@ -583,11 +696,10 @@ pub fn validate(cfg: &Config) -> Result<()> {
         errs.push(e.to_string());
     }
     if let Some(u) = &cfg.public_url {
-        match url::Url::parse(u) {
-            Ok(p) if matches!(p.scheme(), "http" | "https") && p.host_str().is_some() => {}
-            _ => errs.push(format!(
+        if !is_http_url(u) {
+            errs.push(format!(
                 "public_url {u:?} must be an http(s) URL such as \"https://status.example.org\""
-            )),
+            ));
         }
     }
     if cfg.data_dir.as_os_str().is_empty() {
@@ -691,6 +803,98 @@ pub fn validate(cfg: &Config) -> Result<()> {
                     errs.push(format!("webhook notifier url {url:?} is not a valid URL"));
                 }
             }
+            NotifierConfig::Ntfy { url, topic, token } => {
+                if !is_http_url(url) {
+                    errs.push(format!("ntfy notifier url {url:?} must be an http(s) URL"));
+                }
+                if topic.trim().is_empty() {
+                    errs.push("ntfy notifier needs a topic".to_string());
+                }
+                if token.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                    errs.push("ntfy notifier token must not be empty when set".to_string());
+                }
+            }
+            NotifierConfig::Discord { url } => {
+                if !is_http_url(url) {
+                    errs.push(format!(
+                        "discord notifier url {url:?} must be an http(s) URL"
+                    ));
+                }
+            }
+            NotifierConfig::Slack { url } => {
+                if !is_http_url(url) {
+                    errs.push(format!("slack notifier url {url:?} must be an http(s) URL"));
+                }
+            }
+            NotifierConfig::Pushover { token, user } => {
+                if token.trim().is_empty() || user.trim().is_empty() {
+                    errs.push("pushover notifier needs token and user".to_string());
+                }
+            }
+        }
+    }
+
+    if cfg.subscriptions.enabled && cfg.public_url.is_none() {
+        errs.push(
+            "subscriptions need public_url: confirmation and unsubscribe links point there"
+                .to_string(),
+        );
+    }
+
+    if let Some(e) = &cfg.subscriptions.email {
+        if e.host.trim().is_empty() {
+            errs.push("subscriptions.email.host must not be empty".to_string());
+        }
+        if e.from.parse::<lettre::message::Mailbox>().is_err() {
+            errs.push(format!(
+                "subscriptions.email.from {:?} is not an address such as \"Status <status@example.org>\"",
+                e.from
+            ));
+        }
+        if e.username.is_some() != e.password.is_some() {
+            errs.push(
+                "subscriptions.email needs both username and password, or neither".to_string(),
+            );
+        }
+        if e.port == Some(0) {
+            errs.push("subscriptions.email.port must not be 0".to_string());
+        }
+    }
+
+    if let Some(t) = &cfg.subscriptions.telegram {
+        let token_ok = t.token.split_once(':').is_some_and(|(id, secret)| {
+            !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && !secret.is_empty()
+        });
+        if !token_ok {
+            errs.push("subscriptions.telegram.token must be a bot token such as \"123456:ABC…\" from @BotFather".to_string());
+        }
+        if let Some(u) = &t.username {
+            let ok = (5..=32).contains(&u.len())
+                && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !ok {
+                errs.push(format!(
+                    "subscriptions.telegram.username {u:?} must be the bot's name without @, such as \"acme_status_bot\""
+                ));
+            }
+        }
+    }
+
+    let mut key_names = HashSet::new();
+    for k in &cfg.api_keys {
+        if k.name.trim().is_empty() {
+            errs.push("api_keys entries need a name".to_string());
+        } else if !key_names.insert(k.name.as_str()) {
+            errs.push(format!("duplicate api key name {:?}", k.name));
+        }
+        let hex_ok = k.hash.len() == 64
+            && k.hash
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !hex_ok {
+            errs.push(format!(
+                "api key {:?} hash must be 64 lowercase hex characters (run `dunlin hash-token`)",
+                k.name
+            ));
         }
     }
 
@@ -702,6 +906,11 @@ pub fn validate(cfg: &Config) -> Result<()> {
             errs.join("\n  - ")
         ))
     }
+}
+
+fn is_http_url(u: &str) -> bool {
+    url::Url::parse(u)
+        .is_ok_and(|p| matches!(p.scheme(), "http" | "https") && p.host_str().is_some())
 }
 
 fn validate_check(c: &CheckConfig, errs: &mut Vec<String>) {
@@ -885,6 +1094,247 @@ check = "nope"
             let err = parse_str(&with(bad)).unwrap_err().to_string();
             assert!(err.contains("public_url"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn chat_notifiers_parse_and_compare() {
+        let s = format!(
+            r#"{}
+[[notifiers]]
+type = "ntfy"
+url = "https://ntfy.sh"
+topic = "alerts"
+[[notifiers]]
+type = "discord"
+url = "https://discord.com/api/webhooks/1/x"
+[[notifiers]]
+type = "slack"
+url = "https://hooks.slack.com/services/x"
+[[notifiers]]
+type = "pushover"
+token = "app"
+user = "me"
+"#,
+            base_with_real_hash()
+        );
+        let cfg = parse_str(&s).unwrap();
+        assert_eq!(cfg.notifiers.len(), 4);
+        assert_eq!(
+            cfg.notifiers[0],
+            NotifierConfig::Ntfy {
+                url: "https://ntfy.sh".into(),
+                topic: "alerts".into(),
+                token: None,
+            }
+        );
+        // Reload rebuilds the channels only when this comparison differs.
+        let changed = parse_str(&s.replace("alerts", "other")).unwrap();
+        assert_ne!(cfg.notifiers, changed.notifiers);
+    }
+
+    #[test]
+    fn chat_notifiers_validated() {
+        let with = |n: &str| format!("{}\n[[notifiers]]\n{n}\n", base_with_real_hash());
+        let cases = [
+            (
+                "type = \"ntfy\"\nurl = \"ntfy.sh\"\ntopic = \"a\"",
+                "ntfy notifier url",
+            ),
+            (
+                "type = \"ntfy\"\nurl = \"https://ntfy.sh\"\ntopic = \" \"",
+                "topic",
+            ),
+            (
+                "type = \"ntfy\"\nurl = \"https://ntfy.sh\"\ntopic = \"a\"\ntoken = \"\"",
+                "token must not be empty",
+            ),
+            (
+                "type = \"discord\"\nurl = \"ftp://x.org\"",
+                "discord notifier url",
+            ),
+            ("type = \"slack\"\nurl = \"\"", "slack notifier url"),
+            (
+                "type = \"pushover\"\ntoken = \"\"\nuser = \"u\"",
+                "pushover",
+            ),
+            (
+                "type = \"pushover\"\ntoken = \"t\"\nuser = \"\"",
+                "pushover",
+            ),
+        ];
+        for (n, want) in cases {
+            let err = parse_str(&with(n)).unwrap_err().to_string();
+            assert!(err.contains(want), "{n}: {err}");
+        }
+        // A missing required key is a parse error rather than a validation one.
+        assert!(parse_str(&with("type = \"pushover\"\ntoken = \"t\"")).is_err());
+        assert!(parse_str(&with("type = \"ntfy\"\nurl = \"https://ntfy.sh\"")).is_err());
+    }
+
+    #[test]
+    fn subscriptions_default_off_and_need_public_url() {
+        assert!(
+            !parse_str(&base_with_real_hash())
+                .unwrap()
+                .subscriptions
+                .enabled
+        );
+        let on = format!(
+            "{}\n[subscriptions]\nenabled = true\n",
+            base_with_real_hash()
+        );
+        let err = parse_str(&on).unwrap_err().to_string();
+        assert!(err.contains("subscriptions need public_url"), "{err}");
+        let with_url = format!("public_url = \"https://status.example.org\"\n{on}");
+        assert!(parse_str(&with_url).unwrap().subscriptions.enabled);
+        let bogus = format!("{}\n[subscriptions]\nbogus = 1\n", base_with_real_hash());
+        assert!(parse_str(&bogus).is_err());
+    }
+
+    #[test]
+    fn email_channel_config() {
+        let with = |email: &str| {
+            format!(
+                "public_url = \"https://status.example.org\"\n{}\n[subscriptions]\nenabled = true\n[subscriptions.email]\n{email}\n",
+                base_with_real_hash()
+            )
+        };
+        let cfg = parse_str(&with(
+            "enabled = true\nhost = \"smtp.example.org\"\nfrom = \"Status <status@example.org>\"",
+        ))
+        .unwrap();
+        let e = cfg.subscriptions.email.unwrap();
+        assert!(e.enabled);
+        assert_eq!((e.tls, e.port()), (SmtpTls::Starttls, 587));
+        let e = parse_str(&with(
+            "host = \"h\"\nfrom = \"s@example.org\"\ntls = \"implicit\"",
+        ))
+        .unwrap()
+        .subscriptions
+        .email
+        .unwrap();
+        assert_eq!(
+            (e.tls, e.port(), e.enabled),
+            (SmtpTls::Implicit, 465, false)
+        );
+        let e = parse_str(&with("host = \"h\"\nfrom = \"s@example.org\"\nport = 2525"))
+            .unwrap()
+            .subscriptions
+            .email
+            .unwrap();
+        assert_eq!(e.port(), 2525);
+
+        let cases = [
+            ("host = \" \"\nfrom = \"s@example.org\"", "email.host"),
+            ("host = \"h\"\nfrom = \"not an address\"", "email.from"),
+            (
+                "host = \"h\"\nfrom = \"s@example.org\"\nusername = \"u\"",
+                "both username and password",
+            ),
+            (
+                "host = \"h\"\nfrom = \"s@example.org\"\nport = 0",
+                "port must not be 0",
+            ),
+        ];
+        for (email, want) in cases {
+            let err = parse_str(&with(email)).unwrap_err().to_string();
+            assert!(err.contains(want), "{email}: {err}");
+        }
+        // Unknown TLS modes and keys are refused when parsing.
+        assert!(parse_str(&with(
+            "host = \"h\"\nfrom = \"s@example.org\"\ntls = \"none\""
+        ))
+        .is_err());
+        assert!(parse_str(&with("host = \"h\"\nfrom = \"s@example.org\"\nbogus = 1")).is_err());
+        // A missing host or sender is a parse error too.
+        assert!(parse_str(&with("from = \"s@example.org\"")).is_err());
+    }
+
+    #[test]
+    fn subscriber_webhook_config() {
+        let with = |t: &str| {
+            format!(
+                "public_url = \"https://status.example.org\"\n{}\n[subscriptions]\nenabled = true\n[subscriptions.webhook]\n{t}\n",
+                base_with_real_hash()
+            )
+        };
+        let cfg = parse_str(&with("enabled = true")).unwrap();
+        assert!(cfg.subscriptions.webhook.unwrap().enabled);
+        assert!(
+            !parse_str(&with(""))
+                .unwrap()
+                .subscriptions
+                .webhook
+                .unwrap()
+                .enabled
+        );
+        assert!(parse_str(&with("url = \"x\"")).is_err());
+    }
+
+    #[test]
+    fn subscriber_telegram_config() {
+        let with = |t: &str| {
+            format!(
+                "public_url = \"https://status.example.org\"\n{}\n[subscriptions]\nenabled = true\n[subscriptions.telegram]\n{t}\n",
+                base_with_real_hash()
+            )
+        };
+        let t = parse_str(&with(
+            "enabled = true\ntoken = \"123456:ABC-def_1\"\nusername = \"acme_status_bot\"",
+        ))
+        .unwrap()
+        .subscriptions
+        .telegram
+        .unwrap();
+        assert!(t.enabled);
+        assert_eq!(t.username.as_deref(), Some("acme_status_bot"));
+        assert!(parse_str(&with("token = \"1:x\""))
+            .unwrap()
+            .subscriptions
+            .telegram
+            .unwrap()
+            .username
+            .is_none());
+        for (t, want) in [
+            ("token = \"nocolon\"", "telegram.token"),
+            ("token = \"abc:def\"", "telegram.token"),
+            ("token = \"123:\"", "telegram.token"),
+            (
+                "token = \"1:x\"\nusername = \"@acme_bot\"",
+                "telegram.username",
+            ),
+            ("token = \"1:x\"\nusername = \"abc\"", "telegram.username"),
+        ] {
+            let err = parse_str(&with(t)).unwrap_err().to_string();
+            assert!(err.contains(want), "{t}: {err}");
+        }
+        assert!(parse_str(&with("enabled = true")).is_err());
+    }
+
+    #[test]
+    fn api_keys_validated() {
+        let hash = "a".repeat(64);
+        let key = |name: &str, hash: &str| {
+            format!("[[api_keys]]\nname = \"{name}\"\nhash = \"{hash}\"\n")
+        };
+        let with = |keys: String| format!("{}\n{keys}", base_with_real_hash());
+
+        let cfg = parse_str(&with(key("grafana", &hash) + &key("ci", &"0".repeat(64)))).unwrap();
+        assert_eq!(cfg.api_keys.len(), 2);
+        assert_eq!(cfg.api_keys[0].name, "grafana");
+
+        let cases = [
+            (key(" ", &hash), "need a name"),
+            (key("a", &hash) + &key("a", &hash), "duplicate api key name"),
+            (key("a", &"A".repeat(64)), "64 lowercase hex"),
+            (key("a", &"a".repeat(63)), "64 lowercase hex"),
+            (key("a", &"g".repeat(64)), "64 lowercase hex"),
+        ];
+        for (keys, want) in cases {
+            let err = parse_str(&with(keys.clone())).unwrap_err().to_string();
+            assert!(err.contains(want), "{keys}: {err}");
+        }
+        assert!(parse_str(&with("[[api_keys]]\nname = \"a\"\n".into())).is_err());
     }
 
     #[test]

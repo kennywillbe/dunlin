@@ -10,6 +10,7 @@ use crate::config::{CheckConfig, Config};
 use crate::db::{self, Pool};
 use crate::models::{Health, IncidentState, Notification, State};
 use crate::notifier::MultiNotifier;
+use crate::subscriptions::{self, IncidentChange};
 
 /// What the state machine wants done after one result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +111,8 @@ pub struct AlertEngine {
     notifiers: Arc<MultiNotifier>,
     /// `public_url` from the config; notifications link to the incident.
     public_url: Option<String>,
+    /// The running config, for telling subscribers; `None` tells nobody.
+    subscriptions: Option<Arc<Config>>,
 }
 
 impl AlertEngine {
@@ -118,7 +121,13 @@ impl AlertEngine {
             machines: HashMap::new(),
             notifiers,
             public_url,
+            subscriptions: None,
         }
+    }
+
+    /// Follow a reloaded config for subscriber messages.
+    pub fn set_subscriptions(&mut self, cfg: Arc<Config>) {
+        self.subscriptions = Some(cfg);
     }
 
     /// Follow a reloaded `public_url`.
@@ -184,17 +193,21 @@ impl AlertEngine {
                 .and_then(|p| p.component(&incident.component))
                 .map_or(incident.component.as_str(), |c| c.name.as_str());
             db::resolve_incident(pool, incident.id, now).await?;
-            db::add_update(
-                pool,
-                incident.id,
-                now,
-                IncidentState::Resolved,
-                &format!("Resolved: {name} is no longer monitored."),
-                true,
-            )
-            .await?;
+            let text = format!("Resolved: {name} is no longer monitored.");
+            db::add_update(pool, incident.id, now, IncidentState::Resolved, &text, true).await?;
             // No notification: removing the check from the config was a
             // deliberate act, so a "recovered" alert would be false and noise.
+            // Subscribers did hear the incident open, though, and without
+            // this would think it still is.
+            subscriptions::publish_incident(
+                pool,
+                cfg,
+                incident.id,
+                IncidentChange::Resolved,
+                &text,
+                now,
+            )
+            .await;
             tracing::info!(
                 incident = incident.id,
                 component = %incident.component,
@@ -256,17 +269,24 @@ impl AlertEngine {
                             now,
                         )
                         .await?;
-                        db::add_update(
-                            pool,
-                            id,
-                            now,
-                            IncidentState::Investigating,
-                            // This text leads the status page's detail paragraph, so it
-                            // reads as a sentence rather than a raw probe error.
-                            &sentence_case(message.unwrap_or("check failed")),
-                            true,
-                        )
-                        .await?;
+                        // This text leads the status page's detail paragraph, so it
+                        // reads as a sentence rather than a raw probe error.
+                        let text = sentence_case(message.unwrap_or("check failed"));
+                        db::add_update(pool, id, now, IncidentState::Investigating, &text, true)
+                            .await?;
+                        if muted {
+                            subscriptions::mark_quiet(pool, id).await?;
+                        } else if let Some(cfg) = &self.subscriptions {
+                            subscriptions::publish_incident(
+                                pool,
+                                cfg,
+                                id,
+                                IncidentChange::Opened,
+                                &text,
+                                now,
+                            )
+                            .await;
+                        }
                         id
                     }
                 };
@@ -281,21 +301,27 @@ impl AlertEngine {
                         component: component.to_string(),
                         state: State::MajorOutage,
                         incident_id: Some(id),
+                        link: None,
                     })
                     .await;
                 }
             }
             Transition::Resolve(id) => {
                 db::resolve_incident(pool, id, now).await?;
-                db::add_update(
-                    pool,
-                    id,
-                    now,
-                    IncidentState::Resolved,
-                    "Automatically resolved after recovery.",
-                    true,
-                )
-                .await?;
+                let text = "Automatically resolved after recovery.";
+                db::add_update(pool, id, now, IncidentState::Resolved, text, true).await?;
+                // A quiet incident stays quiet; publish_incident checks.
+                if let Some(cfg) = &self.subscriptions {
+                    subscriptions::publish_incident(
+                        pool,
+                        cfg,
+                        id,
+                        IncidentChange::Resolved,
+                        text,
+                        now,
+                    )
+                    .await;
+                }
                 if !muted {
                     self.notify(Notification {
                         event: "up".to_string(),
@@ -304,6 +330,7 @@ impl AlertEngine {
                         component: component.to_string(),
                         state: State::Operational,
                         incident_id: Some(id),
+                        link: None,
                     })
                     .await;
                 }
@@ -317,6 +344,7 @@ impl AlertEngine {
                         component: component.to_string(),
                         state: State::MajorOutage,
                         incident_id: Some(id),
+                        link: None,
                     })
                     .await;
                 }
@@ -327,7 +355,9 @@ impl AlertEngine {
 
     async fn notify(&self, mut n: Notification) {
         if let (Some(base), Some(id)) = (&self.public_url, n.incident_id) {
-            n.message = format!("{}\n{}", n.message, incident_url(base, id));
+            let link = incident_url(base, id);
+            n.message = format!("{}\n{link}", n.message);
+            n.link = Some(link);
         }
         self.notifiers.send(&n).await;
     }
@@ -551,6 +581,11 @@ mod tests {
             sent[0].message,
             format!("boom\nhttps://status.example.org/incidents/{id}")
         );
+        assert_eq!(
+            sent[0].link.as_deref(),
+            Some(format!("https://status.example.org/incidents/{id}").as_str())
+        );
+        assert_eq!(sent[0].text(), "boom");
     }
 
     #[tokio::test]
@@ -714,6 +749,174 @@ mod tests {
         let manual = db::incident(&pool, manual).await.unwrap().unwrap();
         assert!(manual.resolved_at.is_none());
         assert_eq!(manual.state, IncidentState::Identified);
+    }
+
+    /// A config that tells subscribers, with one active subscriber to all.
+    async fn with_subscriber(pool: &Pool) -> Arc<Config> {
+        let mut cfg = web_config();
+        cfg.public_url = Some("https://status.example.org".into());
+        cfg.subscriptions.enabled = true;
+        let req = crate::subscriptions::SignUp {
+            channel: "fake".into(),
+            address: "a".into(),
+            all_components: true,
+            components: vec![],
+            maintenance: false,
+        };
+        crate::subscriptions::sign_up(pool, &req, 0).await.unwrap();
+        sqlx::query("UPDATE subscribers SET status = 'active'")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM outbox")
+            .execute(pool)
+            .await
+            .unwrap();
+        Arc::new(cfg)
+    }
+
+    async fn queued(pool: &Pool) -> Vec<(String, String)> {
+        use sqlx::Row;
+        sqlx::query("SELECT kind, payload FROM outbox ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&r.get::<String, _>("payload")).unwrap();
+                (
+                    r.get("kind"),
+                    payload["message"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn subscribers_hear_automatic_incidents_unless_muted() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        engine.set_subscriptions(with_subscriber(&pool).await);
+        let c = check();
+        for t in 0..3 {
+            feed(
+                &mut engine,
+                &pool,
+                &c,
+                false,
+                Some("connection refused"),
+                t,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        // A reminder is not news to subscribers.
+        feed(
+            &mut engine,
+            &pool,
+            &c,
+            false,
+            Some("connection refused"),
+            200,
+            false,
+        )
+        .await
+        .unwrap();
+        for t in 201..203 {
+            feed(&mut engine, &pool, &c, true, None, t, false)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            queued(&pool).await,
+            [
+                (
+                    "incident_opened".to_string(),
+                    "Connection refused.".to_string()
+                ),
+                (
+                    "incident_resolved".to_string(),
+                    "Automatically resolved after recovery.".to_string()
+                ),
+            ]
+        );
+
+        // During maintenance the incident still opens, but quietly, and it
+        // stays quiet after the window: no "resolved" for an incident
+        // subscribers never heard open, nor an operator's update to it.
+        sqlx::query("DELETE FROM outbox")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for t in 300..303 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, true)
+                .await
+                .unwrap();
+        }
+        let quiet = db::active_incidents(&pool).await.unwrap()[0].id;
+        let cfg = engine.subscriptions.clone().unwrap();
+        subscriptions::publish_incident(&pool, &cfg, quiet, IncidentChange::Updated, "x", 304)
+            .await;
+        for t in 400..402 {
+            feed(&mut engine, &pool, &c, true, None, t, false)
+                .await
+                .unwrap();
+        }
+        assert!(db::incident(&pool, quiet)
+            .await
+            .unwrap()
+            .unwrap()
+            .resolved_at
+            .is_some());
+        assert!(queued(&pool).await.is_empty());
+
+        // Opened normally, resolved during maintenance: subscribers heard it
+        // open, so they hear it close.
+        for t in 500..503 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        for t in 600..602 {
+            feed(&mut engine, &pool, &c, true, None, t, true)
+                .await
+                .unwrap();
+        }
+        let kinds: Vec<String> = queued(&pool).await.into_iter().map(|q| q.0).collect();
+        assert_eq!(kinds, ["incident_opened", "incident_resolved"]);
+    }
+
+    #[tokio::test]
+    async fn subscribers_hear_when_a_removed_check_s_incident_closes() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        let before = with_subscriber(&pool).await;
+        let c = check();
+        for t in 0..3 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let mut after = Config {
+            public_url: before.public_url.clone(),
+            ..Default::default()
+        };
+        after.subscriptions.enabled = true;
+        engine
+            .forget_unmonitored(&pool, &after, Some(&before), 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued(&pool).await,
+            [(
+                "incident_resolved".to_string(),
+                "Resolved: Web site is no longer monitored.".to_string()
+            )]
+        );
     }
 
     #[tokio::test]

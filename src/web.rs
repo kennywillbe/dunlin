@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, WWW_AUTHENTICATE,
+};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -22,9 +24,16 @@ use crate::days::Day;
 use crate::db::{self, Pool};
 use crate::models::State as CompState;
 use crate::status;
+use crate::subscriptions::{self, IncidentChange};
+
+mod subscribe;
 use crate::templates::*;
 use crate::web_auth::{
     clear_session_cookie, client_ip, csrf_ok, session_cookie, LoginLimiter, SESSION_COOKIE,
+};
+use subscribe::{
+    confirm_page, confirm_submit, delete_subscriber, subscribe_page, subscribe_submit,
+    unsubscribe_page, unsubscribe_submit,
 };
 
 #[derive(Clone)]
@@ -32,7 +41,16 @@ pub struct AppState {
     pub pool: Pool,
     pub config: watch::Receiver<Arc<Config>>,
     pub limiter: Arc<LoginLimiter>,
+    /// Sign-ups per client address, separate from logins.
+    pub subscribe_limiter: Arc<LoginLimiter>,
+    /// Subscription channels that are switched on.
+    pub channels: Arc<crate::subscriptions::dispatch::Channels>,
 }
+
+/// Sign-up attempts one address may make per `SUBSCRIBE_WINDOW_SECS`. Each
+/// one can send a message to someone, so the form is not a free relay.
+pub const SUBSCRIBE_MAX: usize = 5;
+pub const SUBSCRIBE_WINDOW_SECS: i64 = 3600;
 
 impl AppState {
     /// Returns the state and the sender used to hot-reload the config.
@@ -43,6 +61,11 @@ impl AppState {
                 pool,
                 config: rx,
                 limiter: Arc::new(LoginLimiter::new()),
+                subscribe_limiter: Arc::new(LoginLimiter::with_limits(
+                    SUBSCRIBE_MAX,
+                    SUBSCRIBE_WINDOW_SECS,
+                )),
+                channels: Arc::default(),
             },
             tx,
         )
@@ -57,11 +80,17 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(status_page))
         .route("/metrics", get(metrics_page))
+        .route("/metrics/prometheus", get(prometheus))
         .route("/api/metrics", get(api_metrics))
+        .route("/api/v1/status", get(api_status))
+        .route("/api/v1/incidents", get(api_incidents))
+        .route("/api/v1/incidents/{id}", get(api_incident))
         .route("/incidents", get(incidents_page))
         .route("/incidents/{id}", get(incident_page))
         .route("/manage", get(manage_page))
         .route("/feed.xml", get(feed))
+        .route("/badge/{file}", get(badge))
+        .route("/badge/{component}/uptime.svg", get(uptime_badge))
         .route("/health", get(health))
         .route("/assets/{file}", get(asset))
         .route("/assets/fonts/{file}", get(font))
@@ -73,6 +102,16 @@ pub fn router(state: AppState) -> Router {
         .route("/incidents/{id}/resolve", post(resolve_incident))
         .route("/maintenance", post(start_maintenance))
         .route("/maintenance/{id}/end", post(end_maintenance))
+        .route("/subscribe", get(subscribe_page).post(subscribe_submit))
+        .route(
+            "/subscribe/confirm/{token}",
+            get(confirm_page).post(confirm_submit),
+        )
+        .route(
+            "/unsubscribe/{token}",
+            get(unsubscribe_page).post(unsubscribe_submit),
+        )
+        .route("/manage/subscribers/{id}/delete", post(delete_subscriber))
         .fallback(not_found)
         .with_state(state)
 }
@@ -155,6 +194,84 @@ async fn write_guard(state: &AppState, headers: &HeaderMap, jar: &CookieJar) -> 
         return Some(Redirect::to("/login").into_response());
     }
     None
+}
+
+/// The token a request presents, from `Authorization: Bearer` or `?token=`.
+/// The query form is for clients that cannot set headers, such as an image
+/// tag or a scraper.
+fn presented_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim().to_string());
+    bearer.or_else(|| {
+        url::form_urlencoded::parse(uri.query()?.as_bytes())
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.into_owned())
+    })
+}
+
+/// Name of the configured API key whose token the request presents.
+fn api_key_name(cfg: &Config, headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let token = presented_token(headers, uri)?;
+    let hash = auth::token_hash(&token);
+    // Every key is compared, so the time taken does not say which one matched.
+    let mut found = None;
+    for key in &cfg.api_keys {
+        if auth::secret_eq(&key.hash, &hash) && found.is_none() {
+            found = Some(key.name.clone());
+        }
+    }
+    found
+}
+
+/// Whether a request may read data. Under `protect_read` that takes an API
+/// key or a session; otherwise everything is public and a key is not needed.
+async fn read_allowed(state: &AppState, headers: &HeaderMap, uri: &Uri, jar: &CookieJar) -> bool {
+    let cfg = state.cfg();
+    if !cfg.web.protect_read {
+        return true;
+    }
+    if let Some(name) = api_key_name(&cfg, headers, uri) {
+        tracing::debug!(api_key = %name, path = %uri.path(), "read with api key");
+        return true;
+    }
+    is_logged_in(state, jar).await
+}
+
+fn api_json(status: StatusCode, body: serde_json::Value) -> Response {
+    (
+        status,
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn api_error(status: StatusCode, error: &str) -> Response {
+    api_json(status, serde_json::json!({ "error": error }))
+}
+
+/// Access check for the JSON API. Clients are programs, so they get a 401
+/// they can act on rather than a redirect to the login form.
+async fn api_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    jar: &CookieJar,
+) -> Option<Response> {
+    if read_allowed(state, headers, uri, jar).await {
+        return None;
+    }
+    let mut resp = api_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    resp.headers_mut()
+        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    Some(resp)
 }
 
 /// Display name for a component id; incidents and maintenance store ids.
@@ -436,15 +553,28 @@ fn kind_word(kind: CheckType) -> &'static str {
     }
 }
 
-async fn build_component(
+/// A component's state and 90-day uptime, as both the status page and the
+/// badges show them, so the two can never disagree.
+struct ComponentNow<'a> {
+    check: Option<&'a crate::config::CheckConfig>,
+    state: CompState,
+    /// `uptime_slots` since `from`, for the day bars.
+    daily: Vec<(i64, i64, i64)>,
+    uptime_90: Option<f64>,
+    last: Option<crate::models::CheckResult>,
+    since: Option<i64>,
+    window: Option<&'a crate::models::Maintenance>,
+}
+
+async fn component_now<'a>(
     pool: &Pool,
-    cfg: &Config,
+    cfg: &'a Config,
     comp: &crate::config::ComponentConfig,
-    maintenance: &[crate::models::Maintenance],
+    maintenance: &'a [crate::models::Maintenance],
     active: &[crate::models::Incident],
-    history: &History,
+    from: i64,
     now: i64,
-) -> (ComponentView, crate::sentence::Snapshot) {
+) -> ComponentNow<'a> {
     let check = comp.check.as_ref().and_then(|id| cfg.check(id));
 
     let (base, daily, last) = match check {
@@ -454,7 +584,6 @@ async fn build_component(
                 .await
                 .unwrap_or(0);
             let base = status::check_state(last.as_ref(), failures, check.failures_to_open);
-            let from = history.days.first().map_or(now, |d| d.start);
             let slots = db::uptime_slots(pool, &check.id, from)
                 .await
                 .unwrap_or_default();
@@ -464,7 +593,7 @@ async fn build_component(
     };
     let total: i64 = daily.iter().map(|(_, t, _)| t).sum();
     let up: i64 = daily.iter().map(|(_, _, u)| u).sum();
-    let uptime_90 = (total > 0).then(|| format_pct(up as f64 / total as f64 * 100.0));
+    let uptime_90 = (total > 0).then(|| up as f64 / total as f64 * 100.0);
 
     let window = maintenance.iter().find(|m| m.covers(&comp.id, now));
     let mine: Vec<&crate::models::Incident> = active
@@ -474,6 +603,37 @@ async fn build_component(
     let impact = mine.iter().map(|i| i.impact).max();
     let state = status::component_state(base, window.is_some(), impact);
     let since = mine.iter().map(|i| i.created_at).min();
+    ComponentNow {
+        check,
+        state,
+        daily,
+        uptime_90,
+        last,
+        since,
+        window,
+    }
+}
+
+async fn build_component(
+    pool: &Pool,
+    cfg: &Config,
+    comp: &crate::config::ComponentConfig,
+    maintenance: &[crate::models::Maintenance],
+    active: &[crate::models::Incident],
+    history: &History,
+    now: i64,
+) -> (ComponentView, crate::sentence::Snapshot) {
+    let from = history.days.first().map_or(now, |d| d.start);
+    let ComponentNow {
+        check,
+        state,
+        daily,
+        uptime_90,
+        last,
+        since,
+        window,
+    } = component_now(pool, cfg, comp, maintenance, active, from, now).await;
+    let uptime_90 = uptime_90.map(format_pct);
     let latency = last.as_ref().and_then(|r| r.latency_ms);
 
     let (sub, sub_class) = match state {
@@ -887,10 +1047,12 @@ struct MetricsQuery {
 
 async fn api_metrics(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
     jar: CookieJar,
     Query(q): Query<MetricsQuery>,
 ) -> Response {
-    if let Some(r) = read_guard(&state, &jar).await {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
         return r;
     }
     let now = crate::now_ts();
@@ -1097,6 +1259,8 @@ async fn manage_page(State(state): State<AppState>, jar: CookieJar) -> Response 
             .collect(),
         maintenance: maintenance_views(&cfg, &windows, now),
         active_incidents: incident_views(&state.pool, &cfg, &active, now).await,
+        timezone: cfg.tz().name().to_string(),
+        subscribers: subscribe::subscribers_view(&state, &cfg).await,
     })
 }
 
@@ -1182,6 +1346,444 @@ const NOSNIFF: (HeaderName, HeaderValue) = (
     HeaderName::from_static("x-content-type-options"),
     HeaderValue::from_static("nosniff"),
 );
+
+/// Access check for badges. Badges are embedded where no session cookie is
+/// sent (READMEs, other dashboards), so an API key works too. Without either
+/// they behave like any read page.
+async fn badge_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    jar: &CookieJar,
+) -> Option<Response> {
+    if read_allowed(state, headers, uri, jar).await {
+        None
+    } else {
+        Some(Redirect::to("/login").into_response())
+    }
+}
+
+enum BadgeFormat {
+    Svg,
+    Json,
+}
+
+fn badge_response(
+    status: StatusCode,
+    format: BadgeFormat,
+    badge: &crate::badge::Badge,
+) -> Response {
+    let (content_type, body) = match format {
+        BadgeFormat::Svg => ("image/svg+xml", badge.svg()),
+        BadgeFormat::Json => ("application/json", badge.endpoint_json()),
+    };
+    (
+        status,
+        [
+            (CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            // A badge is only useful if it is current, and camo (GitHub's
+            // image proxy) caches for as long as it is allowed to.
+            (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            NOSNIFF,
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn badge_not_found(format: BadgeFormat) -> Response {
+    let badge = crate::badge::Badge {
+        label: "badge".to_string(),
+        message: "not found".to_string(),
+        color: crate::badge::NO_DATA,
+    };
+    badge_response(StatusCode::NOT_FOUND, format, &badge)
+}
+
+/// The component's current state and 90-day uptime, as the status page
+/// computes them.
+async fn badge_facts(
+    state: &AppState,
+    cfg: &Config,
+    id: &str,
+) -> Option<(String, CompState, Option<f64>)> {
+    let comp = cfg.component(id)?;
+    let now = crate::now_ts();
+    let windows = db::current_and_upcoming_maintenance(&state.pool, now)
+        .await
+        .unwrap_or_default();
+    let active = db::active_incidents(&state.pool).await.unwrap_or_default();
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, cfg.tz());
+    let from = strip.first().map_or(now, |d| d.start);
+    let c = component_now(&state.pool, cfg, comp, &windows, &active, from, now).await;
+    Some((comp.name.clone(), c.state, c.uptime_90))
+}
+
+/// `/badge/{component}.svg` and `/badge/{component}.json`: current state.
+async fn badge(
+    State(state): State<AppState>,
+    Path(file): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = badge_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let (id, format) = match file.rsplit_once('.') {
+        Some((id, "svg")) => (id, BadgeFormat::Svg),
+        Some((id, "json")) => (id, BadgeFormat::Json),
+        _ => return badge_not_found(BadgeFormat::Svg),
+    };
+    let cfg = state.cfg();
+    let Some((name, comp_state, _)) = badge_facts(&state, &cfg, id).await else {
+        return badge_not_found(format);
+    };
+    let badge = crate::badge::Badge {
+        label: name,
+        message: crate::badge::state_message(comp_state),
+        color: comp_state.rgb(),
+    };
+    badge_response(StatusCode::OK, format, &badge)
+}
+
+/// `/badge/{component}/uptime.svg`: the status page's 90-day uptime figure.
+async fn uptime_badge(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = badge_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let cfg = state.cfg();
+    let Some((name, _, uptime)) = badge_facts(&state, &cfg, &id).await else {
+        return badge_not_found(BadgeFormat::Svg);
+    };
+    let shown = uptime.map(format_pct);
+    // Colour by the figure as shown, so "99.90%" never gets the band below.
+    let color = crate::badge::uptime_color(shown.as_deref().and_then(|s| s.parse().ok()));
+    let badge = crate::badge::Badge {
+        label: format!("{name} uptime"),
+        message: shown.map_or_else(|| "no data".to_string(), |s| format!("{s}%")),
+        color,
+    };
+    badge_response(StatusCode::OK, BadgeFormat::Svg, &badge)
+}
+
+fn incident_json(i: &crate::models::Incident) -> serde_json::Value {
+    serde_json::json!({
+        "id": i.id,
+        "title": i.title,
+        "component": i.component,
+        "state": i.state.as_str(),
+        "impact": i.impact.as_str(),
+        "created_at": i.created_at,
+        "resolved_at": i.resolved_at,
+        "auto": i.auto,
+    })
+}
+
+/// `/api/v1/status`: every component as the status page shows it.
+async fn api_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let cfg = state.cfg();
+    let now = crate::now_ts();
+    let (active, windows) = match tokio::try_join!(
+        db::active_incidents(&state.pool),
+        db::current_and_upcoming_maintenance(&state.pool, now),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "api status failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, cfg.tz());
+    let from = strip.first().map_or(now, |d| d.start);
+    let mut states = Vec::new();
+    let mut components = Vec::new();
+    for comp in &cfg.components {
+        let c = component_now(&state.pool, &cfg, comp, &windows, &active, from, now).await;
+        states.push(c.state);
+        components.push(serde_json::json!({
+            "id": comp.id,
+            "name": comp.name,
+            "group": comp.group,
+            "state": c.state.as_str(),
+            "since": c.since,
+            // The figure the status page prints, as a number.
+            "uptime_90d": c.uptime_90.and_then(|p| format_pct(p).parse::<f64>().ok()),
+        }));
+    }
+    api_json(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": status::overall(states).as_str(),
+            "components": components,
+            "generated_at": now,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct IncidentsQuery {
+    limit: Option<i64>,
+}
+
+/// `/api/v1/incidents`: newest first, open and resolved.
+async fn api_incidents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+    Query(q): Query<IncidentsQuery>,
+) -> Response {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    match db::recent_incidents(&state.pool, limit).await {
+        Ok(list) => api_json(
+            StatusCode::OK,
+            serde_json::Value::Array(list.iter().map(incident_json).collect()),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "api incidents failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// `/api/v1/incidents/{id}`: one incident with its updates, newest first.
+async fn api_incident(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
+    if let Some(r) = api_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let Ok(id) = id.parse::<i64>() else {
+        return api_error(StatusCode::NOT_FOUND, "not found");
+    };
+    let found = match db::incident(&state.pool, id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::error!(error = %e, "api incident failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    let Some(incident) = found else {
+        return api_error(StatusCode::NOT_FOUND, "not found");
+    };
+    let updates = match db::incident_updates(&state.pool, id).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!(error = %e, "api incident updates failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    let mut body = incident_json(&incident);
+    body["updates"] = updates
+        .iter()
+        .rev()
+        .map(|u| {
+            serde_json::json!({
+                "state": u.state.as_str(),
+                "message": u.message,
+                "created_at": u.ts,
+            })
+        })
+        .collect();
+    api_json(StatusCode::OK, body)
+}
+
+/// Newest sample a scrape still exports. The collector writes every 60 s, so
+/// three missed rounds mean the source (a removed container, a stopped
+/// collector) is gone rather than late.
+const SCRAPE_FRESH_SECS: i64 = 180;
+
+/// Access check for the Prometheus endpoint. Scrapers send no session cookie
+/// either, so this goes through the same hook that API keys will use.
+async fn scrape_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    jar: &CookieJar,
+) -> Option<Response> {
+    badge_guard(state, headers, uri, jar).await
+}
+
+/// `/metrics/prometheus`: current checks, components, host and containers.
+async fn prometheus(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    jar: CookieJar,
+) -> Response {
+    use crate::prometheus::Family;
+
+    if let Some(r) = scrape_guard(&state, &headers, &uri, &jar).await {
+        return r;
+    }
+    let cfg = state.cfg();
+    let now = crate::now_ts();
+    let fresh_from = now - SCRAPE_FRESH_SECS;
+    let (host, containers, active, windows) = match tokio::try_join!(
+        db::latest_samples_since(&state.pool, "host", fresh_from),
+        db::latest_samples_since(&state.pool, "container", fresh_from),
+        db::active_incidents(&state.pool),
+        db::current_and_upcoming_maintenance(&state.pool, now),
+    ) {
+        Ok(v) => v,
+        Err(e) => return internal(&state, e),
+    };
+
+    let mut up = Family::gauge(
+        "dunlin_check_up",
+        "Whether the latest probe of the check passed (1) or failed (0).",
+    );
+    let mut latency = Family::gauge(
+        "dunlin_check_latency_seconds",
+        "Latency of the latest probe of the check.",
+    );
+    for check in &cfg.checks {
+        let last = match db::last_check_result(&state.pool, &check.id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(e) => return internal(&state, e),
+        };
+        let labels = vec![("check", check.id.clone())];
+        up.push(labels.clone(), if last.ok { 1.0 } else { 0.0 });
+        if let Some(ms) = last.latency_ms {
+            latency.push(labels, ms / 1000.0);
+        }
+    }
+
+    let mut comp_state = Family::gauge(
+        "dunlin_component_state",
+        "Current state of the component as on the status page: 1 for its state, 0 for the others.",
+    );
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, cfg.tz());
+    let from = strip.first().map_or(now, |d| d.start);
+    for comp in &cfg.components {
+        let current = component_now(&state.pool, &cfg, comp, &windows, &active, from, now)
+            .await
+            .state;
+        for s in [
+            CompState::Operational,
+            CompState::Degraded,
+            CompState::PartialOutage,
+            CompState::MajorOutage,
+            CompState::Maintenance,
+        ] {
+            comp_state.push(
+                vec![
+                    ("component", comp.id.clone()),
+                    ("state", s.as_str().to_string()),
+                ],
+                if s == current { 1.0 } else { 0.0 },
+            );
+        }
+    }
+
+    let mut incidents = Family::gauge("dunlin_incidents_open", "Number of open incidents.");
+    incidents.push(vec![], active.len() as f64);
+
+    let pct = |v: f64| v / 100.0;
+    let mut cpu = Family::gauge("dunlin_host_cpu_usage_ratio", "Host CPU busy time, 0 to 1.");
+    let mut mem = Family::gauge(
+        "dunlin_host_memory_used_ratio",
+        "Host memory in use, 0 to 1.",
+    );
+    let mut swap = Family::gauge("dunlin_host_swap_used_ratio", "Host swap in use, 0 to 1.");
+    let mut load1 = Family::gauge("dunlin_host_load1", "Host load average over 1 minute.");
+    let mut load5 = Family::gauge("dunlin_host_load5", "Host load average over 5 minutes.");
+    let mut load15 = Family::gauge("dunlin_host_load15", "Host load average over 15 minutes.");
+    let mut disk = Family::gauge(
+        "dunlin_host_disk_used_ratio",
+        "Space in use on a mount watched by a disk check, 0 to 1.",
+    );
+    let mut rx = Family::gauge(
+        "dunlin_host_network_receive_bytes_per_second",
+        "Host network bytes received per second.",
+    );
+    let mut tx = Family::gauge(
+        "dunlin_host_network_transmit_bytes_per_second",
+        "Host network bytes sent per second.",
+    );
+    for (metric, key, value) in host {
+        match metric.as_str() {
+            "cpu_pct" => cpu.push(vec![], pct(value)),
+            "mem_pct" => mem.push(vec![], pct(value)),
+            "swap_pct" => swap.push(vec![], pct(value)),
+            "load1" => load1.push(vec![], value),
+            "load5" => load5.push(vec![], value),
+            "load15" => load15.push(vec![], value),
+            "disk_used_pct" => disk.push(vec![("mount", key)], pct(value)),
+            "net_rx_bps" => rx.push(vec![], value),
+            "net_tx_bps" => tx.push(vec![], value),
+            _ => {}
+        }
+    }
+
+    let mut c_cpu = Family::gauge(
+        "dunlin_container_cpu_usage_ratio",
+        "Container CPU use; 1 is one full core.",
+    );
+    let mut c_mem = Family::gauge("dunlin_container_memory_bytes", "Container memory in use.");
+    let mut c_run = Family::gauge(
+        "dunlin_container_running",
+        "Whether the container is running (1) or not (0).",
+    );
+    for (metric, key, value) in containers {
+        let labels = vec![("container", key)];
+        match metric.as_str() {
+            "cpu_pct" => c_cpu.push(labels, pct(value)),
+            "mem_bytes" => c_mem.push(labels, value),
+            "running" => c_run.push(labels, value),
+            _ => {}
+        }
+    }
+
+    let mut build = Family::gauge(
+        "dunlin_build_info",
+        "Always 1; the version is in the label.",
+    );
+    build.push(
+        vec![("version", env!("CARGO_PKG_VERSION").to_string())],
+        1.0,
+    );
+
+    let body = crate::prometheus::render(&[
+        up, latency, comp_state, incidents, cpu, mem, swap, load1, load5, load15, disk, rx, tx,
+        c_cpu, c_mem, c_run, build,
+    ]);
+    (
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static(crate::prometheus::CONTENT_TYPE),
+            ),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            NOSNIFF,
+        ],
+        body,
+    )
+        .into_response()
+}
 
 async fn asset(State(state): State<AppState>, Path(file): Path<String>) -> Response {
     // Files that follow the config are revalidated so a hot reload shows up.
@@ -1506,6 +2108,15 @@ async fn create_incident(
     {
         return internal(&state, e);
     }
+    subscriptions::publish_incident(
+        &state.pool,
+        &state.cfg(),
+        id,
+        IncidentChange::Opened,
+        &message,
+        now,
+    )
+    .await;
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
@@ -1538,6 +2149,15 @@ async fn add_update(
     } else if let Err(e) = db::set_incident_state(&state.pool, id, new_state).await {
         return internal(&state, e);
     }
+    subscriptions::publish_incident(
+        &state.pool,
+        &state.cfg(),
+        id,
+        subscriptions::change_for(new_state),
+        &form.message,
+        now,
+    )
+    .await;
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
@@ -1566,6 +2186,15 @@ async fn resolve_incident(
     {
         return internal(&state, e);
     }
+    subscriptions::publish_incident(
+        &state.pool,
+        &state.cfg(),
+        id,
+        IncidentChange::Resolved,
+        "Resolved by operator.",
+        now,
+    )
+    .await;
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
@@ -1578,9 +2207,27 @@ struct MaintenanceForm {
     component: String,
     note: String,
     duration_minutes: i64,
-    /// Optional explicit start offset in seconds; defaults to now.
+    /// Wall time from the form's `datetime-local` field, in the configured
+    /// timezone. Empty starts now. Wins over `starts_in_seconds`.
+    #[serde(default)]
+    starts_at: String,
+    /// Start offset in seconds, from before `starts_at` existed.
     #[serde(default)]
     starts_in_seconds: Option<i64>,
+}
+
+/// Read a `datetime-local` value (`2026-09-24T14:30`, seconds optional) as
+/// wall time in `tz`.
+fn parse_local_start(value: &str, tz: chrono_tz::Tz) -> Option<i64> {
+    let value = value.trim();
+    [
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ]
+    .iter()
+    .find_map(|f| chrono::NaiveDateTime::parse_from_str(value, f).ok())
+    .map(|local| crate::days::local_to_ts(local, tz))
 }
 
 async fn start_maintenance(
@@ -1596,12 +2243,30 @@ async fn start_maintenance(
     // Clamped so a typo cannot overflow the timestamps; a window longer than
     // a year, or starting further out, is not a maintenance window.
     let duration = form.duration_minutes.clamp(1, MAX_MAINTENANCE_SECS / 60) * 60;
-    let starts = now
-        + form
+    let starts = if form.starts_at.trim().is_empty() {
+        now + form
             .starts_in_seconds
             .unwrap_or(0)
-            .clamp(0, MAX_MAINTENANCE_SECS);
-    if let Err(e) = db::create_maintenance(
+            .clamp(0, MAX_MAINTENANCE_SECS)
+    } else {
+        let cfg = state.cfg();
+        let Some(ts) = parse_local_start(&form.starts_at, cfg.tz()) else {
+            // Starting now instead would mute alerts nobody asked to mute.
+            return error_page(
+                &cfg,
+                StatusCode::BAD_REQUEST,
+                "That start time is not valid",
+                SideView::plain(
+                    &format!("{:?} is not a date and time.", form.starts_at),
+                    "Go back and pick one with the field's picker, or leave it empty to start now.",
+                ),
+            );
+        };
+        // /manage has nowhere to show a form error, and a start a few
+        // minutes back is just a form filled in slowly, so the past is now.
+        ts.clamp(now, now + MAX_MAINTENANCE_SECS)
+    };
+    let id = match db::create_maintenance(
         &state.pool,
         &form.component,
         &form.note,
@@ -1611,7 +2276,13 @@ async fn start_maintenance(
     )
     .await
     {
-        return internal(&state, e);
+        Ok(id) => id,
+        Err(e) => return internal(&state, e),
+    };
+    // A window starting now is announced as started by the dispatcher's
+    // next check; only one planned for later is "scheduled".
+    if starts > now {
+        subscriptions::publish_scheduled(&state.pool, &state.cfg(), id, now).await;
     }
     Redirect::to("/manage").into_response()
 }

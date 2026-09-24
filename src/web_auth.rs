@@ -17,14 +17,31 @@ const SWEEP_AT: usize = 1024;
 
 /// Per-IP login failure tracking. Deliberately per-IP: a single attacker can
 /// only lock out their own address, never everyone.
-#[derive(Default)]
 pub struct LoginLimiter {
     failures: Mutex<HashMap<String, Vec<i64>>>,
+    max: usize,
+    window: i64,
+}
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self::with_limits(MAX_FAILURES, WINDOW_SECS)
+    }
 }
 
 impl LoginLimiter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The same per-IP counting with other limits: at most `max` recorded
+    /// events per `window` seconds.
+    pub fn with_limits(max: usize, window: i64) -> Self {
+        Self {
+            failures: Mutex::new(HashMap::new()),
+            max,
+            window,
+        }
     }
 
     /// Read-only for addresses without failures, so a flood of logins from
@@ -34,8 +51,8 @@ impl LoginLimiter {
         let Some(entry) = map.get_mut(ip) else {
             return false;
         };
-        entry.retain(|t| now - *t < WINDOW_SECS);
-        let blocked = entry.len() >= MAX_FAILURES;
+        entry.retain(|t| now - *t < self.window);
+        let blocked = entry.len() >= self.max;
         if entry.is_empty() {
             map.remove(ip);
         }
@@ -48,12 +65,12 @@ impl LoginLimiter {
         // sweep them all once the map gets large.
         if map.len() >= SWEEP_AT {
             map.retain(|_, times| {
-                times.retain(|t| now - *t < WINDOW_SECS);
+                times.retain(|t| now - *t < self.window);
                 !times.is_empty()
             });
         }
         let entry = map.entry(ip.to_string()).or_default();
-        entry.retain(|t| now - *t < WINDOW_SECS);
+        entry.retain(|t| now - *t < self.window);
         entry.push(now);
     }
 

@@ -56,6 +56,7 @@
   {% endif %}
   <div class="side-foot">
     <a href="/feed.xml">Atom feed</a>
+    {% if site.subscribe %}<a href="/subscribe"{% if site.section == "subscribe" %} aria-current="page"{% endif %}>Subscribe</a>{% endif %}
     {% if site.logged_in %}<form method="post" action="/logout" class="inline"><button type="submit" class="link-button">Log out</button></form>
     {% else %}<a href="/login"{% if site.section == "login" %} aria-current="page"{% endif %}>Log in</a>{% endif %}
     <span>Runs on dunlin</span>
