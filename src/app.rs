@@ -382,7 +382,7 @@ pub async fn prober_loop(
                 .await
             {
                 Ok(_) => {
-                    last.retain(|id, _| cfg.check(id).is_some());
+                    forget_removed_checks(&cfg, &mut last, &mut first_run);
                     applied = cfg.clone();
                 }
                 Err(e) => tracing::warn!(error = %e, "clearing incidents of removed checks"),
@@ -487,6 +487,18 @@ pub async fn prober_loop(
             }
         }
     }
+}
+
+/// Drop per-check timing of checks no longer in `cfg`. A heartbeat removed and
+/// added back under the same id would otherwise count its first-ping grace
+/// from when it was first seen, long ago, and fail at once.
+fn forget_removed_checks(
+    cfg: &Config,
+    last: &mut std::collections::HashMap<String, i64>,
+    first_run: &mut std::collections::HashMap<String, i64>,
+) {
+    last.retain(|id, _| cfg.check(id).is_some());
+    first_run.retain(|id, _| cfg.check(id).is_some());
 }
 
 pub async fn rollup_loop(pool: Pool, config_rx: watch::Receiver<Arc<Config>>) {
@@ -676,6 +688,20 @@ mod tests {
             &theme
         ));
         assert!(!touches_watched(&[temp], &config, &theme));
+    }
+
+    #[test]
+    fn removed_checks_lose_their_timing() {
+        let cfg = Config {
+            checks: vec![test_check()],
+            ..Config::default()
+        };
+        let timing =
+            || std::collections::HashMap::from([("c".to_string(), 1), ("gone".to_string(), 2)]);
+        let (mut last, mut first_run) = (timing(), timing());
+        forget_removed_checks(&cfg, &mut last, &mut first_run);
+        assert_eq!(last.keys().collect::<Vec<_>>(), ["c"]);
+        assert_eq!(first_run.keys().collect::<Vec<_>>(), ["c"]);
     }
 
     #[tokio::test]
