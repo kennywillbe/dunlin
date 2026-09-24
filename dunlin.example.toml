@@ -5,6 +5,8 @@
 # logged and the running configuration is kept.
 
 # Address the web UI and API listen on. Required.
+# In Docker use "0.0.0.0:8080": inside a container 127.0.0.1 is the container
+# itself, so the published port would reach nothing.
 listen = "127.0.0.1:8080"
 
 # Directory for the SQLite database. The DB is created as <data_dir>/dunlin.db.
@@ -19,9 +21,14 @@ data_dir = "data"
 proc_root = "/proc"
 
 # Trust X-Forwarded-For / X-Real-IP for the client address. Only enable this
-# when dunlin is behind a reverse proxy you control.
+# when dunlin is behind exactly one reverse proxy you control: the last
+# X-Forwarded-For entry, the one that proxy appends, is taken as the client.
 # Default: false
 trusted_proxy = false
+
+# Public address of this status page. Notifications link to the incident
+# under it, and the Atom feed uses it for its links. Optional.
+# public_url = "https://status.example.org"
 
 # Mark the session cookie Secure (only when serving over HTTPS).
 # Default: false
@@ -63,6 +70,7 @@ accent = "#17150f"
 # Keep raw per-minute samples for this many days. Default: 7
 raw_days = 7
 # Keep hourly aggregates for this many days. Default: 90
+# Probe results (uptime bars) are kept as long, but never under 90 days.
 hourly_days = 90
 
 # Daily summary message (also proves dunlin is running). Optional; omit to
@@ -168,6 +176,8 @@ restart_limit = 5
 id = "root-disk"
 name = "Root disk"
 type = "disk"
+# A path as dunlin sees it. In Docker, "/" is the container's own filesystem:
+# mount the host's (e.g. "/:/host/root:ro") and use mount = "/host/root".
 mount = "/"
 # Warn at or above warn, fail at or above critical. Percentages.
 warn = 80.0

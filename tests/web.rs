@@ -259,12 +259,22 @@ async fn protect_read_locks_read_pages() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(headers.get("location").unwrap(), "/login");
 
+    // The feed repeats incident titles and messages, so it is locked too.
+    let (status, headers, _) = send(app.clone(), get("/feed.xml")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers.get("location").unwrap(), "/login");
+
     let cookie = login(&app).await;
     let mut req = get("/");
     req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
-    let (status, _, body) = send(app, req).await;
+    let (status, _, body) = send(app.clone(), req).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Website"));
+
+    let mut req = get("/feed.xml");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -860,4 +870,51 @@ async fn theme_follows_hot_reload() {
     let (status, _, body) = send(app, get("/assets/custom.css")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "body{}");
+}
+
+#[tokio::test]
+async fn incident_on_all_components_shows_on_every_component() {
+    let (state, pool) = state(false).await;
+    db::create_incident(
+        &pool,
+        "",
+        "Everything is on fire",
+        dunlin::models::State::MajorOutage,
+        dunlin::models::IncidentState::Investigating,
+        false,
+        dunlin::now_ts() - 60,
+    )
+    .await
+    .unwrap();
+
+    let (status, _, body) = send(app(state), get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Everything is up."), "{body}");
+    assert!(body.contains("svc s-major_outage"), "{body}");
+    assert!(!body.contains("svc s-operational"), "{body}");
+    assert!(body.contains("bar s-major_outage today"), "{body}");
+}
+
+#[tokio::test]
+async fn huge_maintenance_duration_is_clamped() {
+    let (state, pool) = state(false).await;
+    let app = app(state);
+    let cookie = login(&app).await;
+    let mut req = post_form(
+        "/maintenance",
+        &format!(
+            "component=web&note=x&duration_minutes={}&starts_in_seconds=-5",
+            i64::MAX
+        ),
+    );
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let now = dunlin::now_ts();
+    let windows = db::active_maintenance(&pool, now).await.unwrap();
+    assert_eq!(windows.len(), 1);
+    let w = &windows[0];
+    assert!(w.starts_at >= now - 5, "{w:?}");
+    assert!(w.ends_at <= now + 366 * 86_400 + 5, "{w:?}");
 }

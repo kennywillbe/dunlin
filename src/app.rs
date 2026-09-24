@@ -94,6 +94,13 @@ pub fn apply_reload(path: &Path, tx: &watch::Sender<Arc<Config>>) {
     match config::load(path) {
         Ok(new) => {
             tracing::info!(path = %path.display(), "configuration reloaded");
+            let pending = tx.borrow().restart_only_changes(&new);
+            if !pending.is_empty() {
+                tracing::warn!(
+                    keys = %pending.join(", "),
+                    "these settings changed but only take effect after a restart"
+                );
+            }
             tx.send_replace(Arc::new(new));
         }
         Err(e) => {
@@ -109,7 +116,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let http = prober::http_client()?;
     let notifiers = Arc::new(MultiNotifier::new(build_notifiers(&cfg, &http)));
 
-    let mut engine = AlertEngine::new(notifiers.clone(), None);
+    let mut engine = AlertEngine::new(notifiers.clone(), cfg.public_url.clone());
     engine.bootstrap(&pool, &cfg).await?;
     let engine = Arc::new(Mutex::new(engine));
 
@@ -117,6 +124,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     spawn_config_watcher(config_path, config_tx.clone())?;
     let config_rx = state.config.clone();
 
+    tokio::spawn(notifier_reload_loop(
+        config_rx.clone(),
+        notifiers.clone(),
+        http.clone(),
+        cfg.notifiers.clone(),
+    ));
     tokio::spawn(collector_loop(pool.clone(), config_rx.clone()));
     tokio::spawn(prober_loop(
         pool.clone(),
@@ -143,6 +156,27 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     .await
     .context("http server")?;
     Ok(())
+}
+
+/// Rebuild the notification channels when `[[notifiers]]` changes, so the
+/// alert engine and the daily summary send to the reloaded ones. `built_from`
+/// is the list `notifiers` was made from; taking it from the receiver instead
+/// would miss a reload that lands before this task first runs.
+pub async fn notifier_reload_loop(
+    mut config_rx: watch::Receiver<Arc<Config>>,
+    notifiers: Arc<MultiNotifier>,
+    http: reqwest::Client,
+    built_from: Vec<crate::config::NotifierConfig>,
+) {
+    let mut current = built_from;
+    while config_rx.changed().await.is_ok() {
+        let cfg = config_rx.borrow_and_update().clone();
+        if cfg.notifiers != current {
+            notifiers.replace(build_notifiers(&cfg, &http));
+            current = cfg.notifiers.clone();
+            tracing::info!(channels = current.len(), "notifiers reloaded");
+        }
+    }
 }
 
 fn ensure_docker(cfg: &Config, slot: &mut Option<Arc<dyn DockerSource>>) {
@@ -229,55 +263,38 @@ struct ProbeEnv<'a> {
     http: &'a reqwest::Client,
     containers: Option<&'a [crate::docker::ContainerStat]>,
     units: Option<&'a [crate::systemd::UnitStat]>,
+    /// When this process first ran each check, by id.
+    first_run: &'a std::collections::HashMap<String, i64>,
     now: i64,
 }
 
-async fn evaluate(check: &CheckConfig, env: &ProbeEnv<'_>) -> ProbeOutcome {
-    match check.kind {
+/// Run one check. `None` means there was nothing to judge it by (the Docker
+/// or systemd source is off or did not answer), so no result is recorded.
+async fn evaluate(check: &CheckConfig, env: &ProbeEnv<'_>) -> Option<ProbeOutcome> {
+    let latest = |metric: &'static str, key: String| async move {
+        db::latest_sample(env.pool, "host", metric, &key)
+            .await
+            .ok()
+            .flatten()
+    };
+    Some(match check.kind {
         CheckType::Http => prober::probe_http(env.http, check).await,
         CheckType::Tcp => prober::probe_tcp(check).await,
         CheckType::Disk => {
             let key = check.mount.clone().unwrap_or_default();
-            let latest = db::latest_sample(env.pool, "host", "disk_used_pct", &key)
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
+            prober::probe_resource(check, latest("disk_used_pct", key).await)
         }
-        CheckType::Ram => {
-            let latest = db::latest_sample(env.pool, "host", "mem_pct", "")
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
-        }
-        CheckType::Swap => {
-            let latest = db::latest_sample(env.pool, "host", "swap_pct", "")
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
-        }
-        CheckType::Load => {
-            let latest = db::latest_sample(env.pool, "host", "load1", "")
-                .await
-                .ok()
-                .flatten();
-            prober::probe_resource(check, latest)
-        }
-        CheckType::Docker => match env.containers {
-            Some(c) => prober::probe_docker(check, c),
-            None => ProbeOutcome::up(),
-        },
-        CheckType::Systemd => match env.units {
-            Some(u) => prober::probe_systemd(check, u),
-            None => ProbeOutcome::up(),
-        },
+        CheckType::Ram => prober::probe_resource(check, latest("mem_pct", String::new()).await),
+        CheckType::Swap => prober::probe_resource(check, latest("swap_pct", String::new()).await),
+        CheckType::Load => prober::probe_resource(check, latest("load1", String::new()).await),
+        CheckType::Docker => prober::probe_docker(check, env.containers?),
+        CheckType::Systemd => prober::probe_systemd(check, env.units?),
         CheckType::Heartbeat => {
             let last = db::last_ping(env.pool, &check.id).await.ok().flatten();
-            prober::probe_heartbeat(check, last, env.now)
+            let since = env.first_run.get(&check.id).copied().unwrap_or(env.now);
+            prober::probe_heartbeat(check, last, since, env.now)
         }
-    }
+    })
 }
 
 fn check_samples(check: &CheckConfig, outcome: &ProbeOutcome, now: i64) -> Vec<Sample> {
@@ -300,14 +317,6 @@ fn check_samples(check: &CheckConfig, outcome: &ProbeOutcome, now: i64) -> Vec<S
     out
 }
 
-fn component_for(cfg: &Config, check_id: &str) -> String {
-    cfg.components
-        .iter()
-        .find(|c| c.check.as_deref() == Some(check_id))
-        .map(|c| c.id.clone())
-        .unwrap_or_else(|| check_id.to_string())
-}
-
 pub async fn prober_loop(
     pool: Pool,
     config_rx: watch::Receiver<Arc<Config>>,
@@ -315,6 +324,7 @@ pub async fn prober_loop(
     http: reqwest::Client,
 ) {
     let mut last: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut first_run: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut docker: Option<Arc<dyn DockerSource>> = None;
     let mut systemd: Option<Arc<dyn SystemdSource>> = None;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -336,6 +346,7 @@ pub async fn prober_loop(
         }
         for c in &due {
             last.insert(c.id.clone(), now);
+            first_run.entry(c.id.clone()).or_insert(now);
         }
 
         let needs_docker = due.iter().any(|c| c.kind == CheckType::Docker) && docker.is_some();
@@ -367,31 +378,24 @@ pub async fn prober_loop(
             None
         };
 
-        // Docker/systemd checks whose source is unavailable are skipped rather
-        // than reported down, so a disabled integration cannot raise alerts.
-        let docker_disabled = docker.is_none();
-        let systemd_disabled = systemd.is_none();
-
         let maintenance = db::active_maintenance(&pool, now).await.unwrap_or_default();
 
         for check in &due {
-            if check.kind == CheckType::Docker && docker_disabled {
-                tracing::warn!(check = %check.id, "docker check skipped: docker disabled");
-                continue;
-            }
-            if check.kind == CheckType::Systemd && systemd_disabled {
-                tracing::warn!(check = %check.id, "systemd check skipped: systemd disabled");
-                continue;
-            }
-
             let env = ProbeEnv {
                 pool: &pool,
                 http: &http,
                 containers: containers.as_deref(),
                 units: unit_states.as_deref(),
+                first_run: &first_run,
                 now,
             };
-            let outcome = evaluate(check, &env).await;
+            // A Docker/systemd check whose source is off or did not answer is
+            // skipped: reporting it up would hide an outage and could resolve
+            // its incident, reporting it down would alert on our own problem.
+            let Some(outcome) = evaluate(check, &env).await else {
+                tracing::warn!(check = %check.id, "check skipped: no data from its source");
+                continue;
+            };
             let result = CheckResult {
                 ts: now,
                 check_id: check.id.clone(),
@@ -405,11 +409,11 @@ pub async fn prober_loop(
             }
             let _ = db::insert_samples(&pool, &check_samples(check, &outcome, now)).await;
 
-            let component = component_for(&cfg, &check.id);
+            let component = cfg.incident_component(&check.id);
             let muted = maintenance.iter().any(|m| m.covers(&component, now));
+            let mut engine = engine.lock().await;
+            engine.set_public_url(cfg.public_url.clone());
             if let Err(e) = engine
-                .lock()
-                .await
                 .handle(
                     &pool,
                     crate::alert::AlertInput {
@@ -548,8 +552,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reloaded_notifiers_replace_the_running_ones() {
+        let (tx, rx) = watch::channel(Arc::new(Config::default()));
+        let notifiers = Arc::new(MultiNotifier::new(Vec::new()));
+        let http = prober::http_client().unwrap();
+        tokio::spawn(notifier_reload_loop(
+            rx,
+            notifiers.clone(),
+            http,
+            Vec::new(),
+        ));
+
+        let cfg = Config {
+            notifiers: vec![crate::config::NotifierConfig::Webhook {
+                url: "http://127.0.0.1:9/hook".into(),
+                headers: Default::default(),
+            }],
+            ..Config::default()
+        };
+        tx.send_replace(Arc::new(cfg));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while notifiers.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("notifiers were not rebuilt");
+        assert_eq!(notifiers.len(), 1);
+    }
+
+    #[test]
+    fn restart_only_keys_are_named() {
+        let old = Config::default();
+        let mut new = Config {
+            listen: "127.0.0.1:9090".into(),
+            ..Config::default()
+        };
+        new.docker.socket = Some("/run/docker.sock".into());
+        assert_eq!(
+            old.restart_only_changes(&new),
+            vec!["listen", "docker.socket"]
+        );
+        assert!(old.restart_only_changes(&old.clone()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_checks_without_data_are_skipped_not_passed() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let http = prober::http_client().unwrap();
+        let first_run = Default::default();
+        let env = ProbeEnv {
+            pool: &pool,
+            http: &http,
+            containers: None,
+            units: None,
+            first_run: &first_run,
+            now: 0,
+        };
+        let docker = CheckConfig {
+            kind: CheckType::Docker,
+            container: Some("api".into()),
+            ..test_check()
+        };
+        let systemd = CheckConfig {
+            kind: CheckType::Systemd,
+            unit: Some("nginx.service".into()),
+            ..test_check()
+        };
+        assert_eq!(evaluate(&docker, &env).await, None);
+        assert_eq!(evaluate(&systemd, &env).await, None);
+
+        // With data, the same check is judged.
+        let env = ProbeEnv {
+            containers: Some(&[]),
+            ..env
+        };
+        let out = evaluate(&docker, &env).await.unwrap();
+        assert!(!out.ok, "{out:?}");
+    }
+
+    #[tokio::test]
     async fn check_samples_shape() {
-        let check = CheckConfig {
+        let check = test_check();
+        let outcome = ProbeOutcome::up().with_latency(12.0);
+        let samples = check_samples(&check, &outcome, 5);
+        assert!(samples.iter().any(|s| s.metric == "up" && s.value == 1.0));
+        assert!(samples
+            .iter()
+            .any(|s| s.metric == "latency_ms" && s.value == 12.0));
+    }
+
+    fn test_check() -> CheckConfig {
+        CheckConfig {
             id: "c".into(),
             name: "c".into(),
             kind: CheckType::Tcp,
@@ -575,12 +669,6 @@ mod tests {
             period: None,
             grace: None,
             token: None,
-        };
-        let outcome = ProbeOutcome::up().with_latency(12.0);
-        let samples = check_samples(&check, &outcome, 5);
-        assert!(samples.iter().any(|s| s.metric == "up" && s.value == 1.0));
-        assert!(samples
-            .iter()
-            .any(|s| s.metric == "latency_ms" && s.value == 12.0));
+        }
     }
 }

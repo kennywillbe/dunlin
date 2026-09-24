@@ -263,7 +263,7 @@ fn systemd_default_enabled() -> bool {
 }
 
 /// `[[notifiers]]`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NotifierConfig {
     Telegram {
@@ -422,6 +422,11 @@ pub struct Config {
     pub proc_root: PathBuf,
     #[serde(default)]
     pub trusted_proxy: bool,
+    /// Where people reach this status page, e.g. `https://status.example.org`.
+    /// Notifications link to incidents under it, and the feed uses it instead
+    /// of the request's Host header.
+    #[serde(default)]
+    pub public_url: Option<String>,
     /// Set the `Secure` flag on the session cookie when served over HTTPS.
     #[serde(default)]
     pub secure_cookies: bool,
@@ -469,6 +474,7 @@ impl Default for Config {
             db_path: None,
             proc_root: default_proc_root(),
             trusted_proxy: false,
+            public_url: None,
             secure_cookies: false,
             timezone: default_tz(),
             web: WebConfig::default(),
@@ -505,6 +511,35 @@ impl Config {
 
     pub fn component(&self, id: &str) -> Option<&ComponentConfig> {
         self.components.iter().find(|c| c.id == id)
+    }
+
+    /// The component a check's incidents are filed under: the one that mirrors
+    /// it, or the check id itself when no component does.
+    pub fn incident_component(&self, check_id: &str) -> String {
+        self.components
+            .iter()
+            .find(|c| c.check.as_deref() == Some(check_id))
+            .map(|c| c.id.clone())
+            .unwrap_or_else(|| check_id.to_string())
+    }
+
+    /// Keys whose change only takes effect after a restart, named as in the
+    /// file, for the reload log.
+    pub fn restart_only_changes(&self, new: &Config) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.listen != new.listen {
+            out.push("listen");
+        }
+        if self.data_dir != new.data_dir {
+            out.push("data_dir");
+        }
+        if self.db_path != new.db_path {
+            out.push("db_path");
+        }
+        if self.docker.socket != new.docker.socket {
+            out.push("docker.socket");
+        }
+        out
     }
 
     /// Falls back to UTC only for a config that skipped `validate`.
@@ -546,6 +581,14 @@ pub fn validate(cfg: &Config) -> Result<()> {
 
     if let Err(e) = cfg.listen_addr() {
         errs.push(e.to_string());
+    }
+    if let Some(u) = &cfg.public_url {
+        match url::Url::parse(u) {
+            Ok(p) if matches!(p.scheme(), "http" | "https") && p.host_str().is_some() => {}
+            _ => errs.push(format!(
+                "public_url {u:?} must be an http(s) URL such as \"https://status.example.org\""
+            )),
+        }
     }
     if cfg.data_dir.as_os_str().is_empty() {
         errs.push("data_dir must not be empty".to_string());
@@ -832,6 +875,16 @@ check = "nope"
         );
         let err = parse_str(&s).unwrap_err().to_string();
         assert!(err.contains("requires `token`"), "{err}");
+    }
+
+    #[test]
+    fn public_url_must_be_http() {
+        let with = |u: &str| format!("public_url = \"{u}\"\n{}", base_with_real_hash());
+        assert!(parse_str(&with("https://status.example.org")).is_ok());
+        for bad in ["status.example.org", "ftp://example.org", "https://"] {
+            let err = parse_str(&with(bad)).unwrap_err().to_string();
+            assert!(err.contains("public_url"), "{bad}: {err}");
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Notification channels behind a `Notifier` trait.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -15,26 +16,45 @@ pub trait Notifier: Send + Sync {
     async fn send(&self, notification: &Notification) -> Result<()>;
 }
 
+/// How long one channel may take to accept a notification. Alerts are sent
+/// from the probe loop, so a channel that never answers must not hold it.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Fan-out to every configured channel; one broken channel never stops others.
+/// The channel list can be swapped at runtime when the config is reloaded.
 pub struct MultiNotifier {
-    inner: Vec<Arc<dyn Notifier>>,
+    inner: RwLock<Vec<Arc<dyn Notifier>>>,
 }
 
 impl MultiNotifier {
     pub fn new(inner: Vec<Arc<dyn Notifier>>) -> Self {
-        Self { inner }
+        Self {
+            inner: RwLock::new(inner),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.len() == 0
     }
 
+    /// Replace the channels; sends already under way finish on the old ones.
+    pub fn replace(&self, inner: Vec<Arc<dyn Notifier>>) {
+        *self.inner.write().unwrap() = inner;
+    }
+
+    /// Send to every channel at once, so the slowest one sets the wait.
     pub async fn send(&self, notification: &Notification) {
-        for n in &self.inner {
+        let channels = self.inner.read().unwrap().clone();
+        let sends = channels.iter().map(|n| async move {
             if let Err(e) = n.send(notification).await {
                 tracing::warn!(notifier = n.name(), error = %e, "notification failed");
             }
-        }
+        });
+        futures_util::future::join_all(sends).await;
     }
 }
 
@@ -42,6 +62,7 @@ pub struct TelegramNotifier {
     client: reqwest::Client,
     token: String,
     chat_id: String,
+    timeout: Duration,
 }
 
 impl TelegramNotifier {
@@ -50,6 +71,7 @@ impl TelegramNotifier {
             client,
             token,
             chat_id,
+            timeout: SEND_TIMEOUT,
         }
     }
 }
@@ -66,6 +88,7 @@ impl Notifier for TelegramNotifier {
         let resp = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .json(&serde_json::json!({
                 "chat_id": self.chat_id,
                 "text": text,
@@ -111,6 +134,7 @@ pub struct WebhookNotifier {
     client: reqwest::Client,
     url: String,
     headers: BTreeMap<String, String>,
+    timeout: Duration,
 }
 
 impl WebhookNotifier {
@@ -119,7 +143,13 @@ impl WebhookNotifier {
             client,
             url,
             headers,
+            timeout: SEND_TIMEOUT,
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -133,6 +163,7 @@ impl Notifier for WebhookNotifier {
         let mut req = self
             .client
             .post(&self.url)
+            .timeout(self.timeout)
             .json(&WebhookPayload::from(notification));
         for (k, v) in &self.headers {
             req = req.header(k, v);
@@ -228,6 +259,39 @@ mod tests {
         multi.send(&sample()).await;
         assert_eq!(a.count(), 1);
         assert_eq!(b.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn replaced_channels_get_later_sends() {
+        let a = RecordingNotifier::new();
+        let b = RecordingNotifier::new();
+        let multi = MultiNotifier::new(vec![a.clone()]);
+        multi.send(&sample()).await;
+        multi.replace(vec![b.clone()]);
+        multi.send(&sample()).await;
+        assert_eq!((a.count(), b.count()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn webhook_that_never_answers_times_out() {
+        // Accepts the connection, then never writes a response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let n = WebhookNotifier::new(
+            reqwest::Client::new(),
+            format!("http://{addr}/hook"),
+            BTreeMap::new(),
+        )
+        .with_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        assert!(n.send(&sample()).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]

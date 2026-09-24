@@ -1,6 +1,8 @@
 //! Docker container metrics behind a trait so tests can use a fake.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -54,6 +56,9 @@ pub fn container_samples(stats: &[ContainerStat], now: i64) -> Vec<Sample> {
 /// Live Docker client.
 pub struct BollardDocker {
     docker: bollard::Docker,
+    /// Last CPU counters per container id, for when Docker sends no previous
+    /// reading of its own.
+    last_cpu: Mutex<HashMap<String, CpuCounters>>,
 }
 
 impl BollardDocker {
@@ -67,21 +72,46 @@ impl BollardDocker {
             None => bollard::Docker::connect_with_local_defaults()
                 .context("connecting to the local docker daemon")?,
         };
-        Ok(Self { docker })
+        Ok(Self {
+            docker,
+            last_cpu: Mutex::new(HashMap::new()),
+        })
     }
 }
 
-fn cpu_percent(stats: &bollard::container::Stats) -> f64 {
-    let cpu = stats.cpu_stats.cpu_usage.total_usage;
-    let pre = stats.precpu_stats.cpu_usage.total_usage;
-    let sys = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
-    let presys = stats.precpu_stats.system_cpu_usage.unwrap_or(0);
-    let cpu_delta = cpu.saturating_sub(pre) as f64;
-    let sys_delta = sys.saturating_sub(presys) as f64;
+/// Cumulative CPU time of a container and of the whole host, in nanoseconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuCounters {
+    pub container: u64,
+    pub system: u64,
+}
+
+/// CPU percent over the interval between two readings, 100 per core.
+///
+/// A one-shot stats call leaves `precpu_stats` empty, and a percentage taken
+/// against zeros is the container's average since the host booted, not its
+/// current load. Without a previous reading there is no interval, so 0.
+pub fn cpu_percent(cur: CpuCounters, prev: Option<CpuCounters>, cpus: u64) -> f64 {
+    let Some(prev) = prev.filter(|p| p.system > 0) else {
+        return 0.0;
+    };
+    let cpu_delta = cur.container.saturating_sub(prev.container) as f64;
+    let sys_delta = cur.system.saturating_sub(prev.system) as f64;
     if sys_delta <= 0.0 || cpu_delta <= 0.0 {
         return 0.0;
     }
-    let cpus = stats
+    (cpu_delta / sys_delta) * cpus.max(1) as f64 * 100.0
+}
+
+fn counters(stats: &bollard::container::CPUStats) -> CpuCounters {
+    CpuCounters {
+        container: stats.cpu_usage.total_usage,
+        system: stats.system_cpu_usage.unwrap_or(0),
+    }
+}
+
+fn online_cpus(stats: &bollard::container::Stats) -> u64 {
+    stats
         .cpu_stats
         .online_cpus
         .filter(|n| *n > 0)
@@ -93,8 +123,7 @@ fn cpu_percent(stats: &bollard::container::Stats) -> f64 {
                 .as_ref()
                 .map(|v| v.len() as u64)
         })
-        .unwrap_or(1) as f64;
-    (cpu_delta / sys_delta) * cpus * 100.0
+        .unwrap_or(1)
 }
 
 #[async_trait]
@@ -111,6 +140,13 @@ impl DockerSource for BollardDocker {
             }))
             .await
             .context("listing containers")?;
+
+        // Forget counters of containers that no longer exist.
+        self.last_cpu.lock().unwrap().retain(|id, _| {
+            summaries
+                .iter()
+                .any(|s| s.id.as_deref() == Some(id.as_str()))
+        });
 
         let mut out = Vec::with_capacity(summaries.len());
         for summary in summaries {
@@ -152,11 +188,19 @@ impl DockerSource for BollardDocker {
                 _ => continue,
             };
 
+            // Docker's own previous reading when it sent one, else ours.
+            let cur = counters(&stat.cpu_stats);
+            let prev = Some(counters(&stat.precpu_stats))
+                .filter(|p| p.system > 0)
+                .or_else(|| self.last_cpu.lock().unwrap().get(&id).copied());
+            self.last_cpu.lock().unwrap().insert(id.clone(), cur);
+            let cpu_pct = cpu_percent(cur, prev, online_cpus(&stat));
+
             out.push(ContainerStat {
                 name,
                 running,
                 health,
-                cpu_pct: cpu_percent(&stat),
+                cpu_pct,
                 mem_bytes: stat.memory_stats.usage.unwrap_or(0),
                 mem_limit_bytes: stat.memory_stats.limit.unwrap_or(0),
                 restart_count,
@@ -169,6 +213,19 @@ impl DockerSource for BollardDocker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_is_measured_between_readings_not_since_boot() {
+        let at = |container, system| CpuCounters { container, system };
+        // One-shot stats: no previous reading, so no rate yet...
+        assert_eq!(cpu_percent(at(500, 10_000), None, 4), 0.0);
+        assert_eq!(cpu_percent(at(500, 10_000), Some(at(0, 0)), 4), 0.0);
+        // ...then the share of the interval: 50 of 1000 on 4 cores = 20%.
+        let pct = cpu_percent(at(550, 11_000), Some(at(500, 10_000)), 4);
+        assert!((pct - 20.0).abs() < 1e-9, "{pct}");
+        // Counters that went backwards (container restarted) read as idle.
+        assert_eq!(cpu_percent(at(10, 12_000), Some(at(500, 11_000)), 4), 0.0);
+    }
 
     #[test]
     fn samples_cover_expected_metrics() {

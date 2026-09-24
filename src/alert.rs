@@ -108,31 +108,38 @@ pub struct AlertInput<'a> {
 pub struct AlertEngine {
     machines: HashMap<String, CheckMachine>,
     notifiers: Arc<MultiNotifier>,
-    base_url: Option<String>,
+    /// `public_url` from the config; notifications link to the incident.
+    public_url: Option<String>,
 }
 
 impl AlertEngine {
-    pub fn new(notifiers: Arc<MultiNotifier>, base_url: Option<String>) -> Self {
+    pub fn new(notifiers: Arc<MultiNotifier>, public_url: Option<String>) -> Self {
         Self {
             machines: HashMap::new(),
             notifiers,
-            base_url,
+            public_url,
         }
+    }
+
+    /// Follow a reloaded `public_url`.
+    pub fn set_public_url(&mut self, public_url: Option<String>) {
+        self.public_url = public_url;
     }
 
     pub fn machines(&self) -> &HashMap<String, CheckMachine> {
         &self.machines
     }
 
-    /// Rebuild machines for checks that already have an open incident.
+    /// Rebuild machines for checks that already have an open incident. Walks
+    /// the checks rather than the components: a check no component mirrors
+    /// files its incidents under its own id, and skipping it left such an
+    /// incident open forever once the check recovered after a restart.
     pub async fn bootstrap(&mut self, pool: &Pool, cfg: &Config) -> Result<()> {
-        for component in &cfg.components {
-            let Some(check_id) = component.check.as_ref().filter(|c| !c.is_empty()) else {
-                continue;
-            };
-            if let Some(incident) = db::active_incident_for(pool, &component.id).await? {
+        for check in &cfg.checks {
+            let component = cfg.incident_component(&check.id);
+            if let Some(incident) = db::active_incident_for(pool, &component).await? {
                 self.machines
-                    .insert(check_id.clone(), CheckMachine::resumed(incident.id));
+                    .insert(check.id.clone(), CheckMachine::resumed(incident.id));
             }
         }
         Ok(())
@@ -149,6 +156,19 @@ impl AlertEngine {
             now,
             muted,
         } = input;
+        // An operator may have resolved this check's incident on /manage. The
+        // machine would otherwise keep reminding about a closed incident, never
+        // open a new one, and resolve the closed one a second time on recovery.
+        // Starting over means a failure that persists opens a fresh incident.
+        if let Some(id) = self.machines.get(&check.id).and_then(|m| m.incident_id) {
+            let closed = db::incident(pool, id)
+                .await?
+                .is_none_or(|i| i.resolved_at.is_some());
+            if closed {
+                self.machines
+                    .insert(check.id.clone(), CheckMachine::default());
+            }
+        }
         let transition = {
             let machine = self.machines.entry(check.id.clone()).or_default();
             machine.on_result(check, ok, now)
@@ -240,10 +260,8 @@ impl AlertEngine {
     }
 
     async fn notify(&self, mut n: Notification) {
-        if let Some(base) = &self.base_url {
-            if let Some(id) = n.incident_id {
-                n.message = format!("{}\n{}#/incidents/{}", n.message, base, id);
-            }
+        if let (Some(base), Some(id)) = (&self.public_url, n.incident_id) {
+            n.message = format!("{}\n{}", n.message, incident_url(base, id));
         }
         self.notifiers.send(&n).await;
     }
@@ -429,6 +447,7 @@ mod tests {
                 check: Some("c1".into()),
                 description: None,
             }],
+            checks: vec![check()],
             ..Config::default()
         };
         engine.bootstrap(&pool, &cfg).await.unwrap();
@@ -444,6 +463,125 @@ mod tests {
         assert!(inc.resolved_at.is_some());
         assert_eq!(rec.count(), 1);
     }
+
+    #[tokio::test]
+    async fn notifications_link_to_the_incident_under_public_url() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let multi = MultiNotifier::new(vec![rec.clone()]);
+        let mut engine = AlertEngine::new(
+            Arc::new(multi),
+            Some("https://status.example.org/".to_string()),
+        );
+        let c = check();
+        for t in 0..3 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let id = db::active_incidents(&pool).await.unwrap()[0].id;
+        let sent = rec.messages();
+        assert_eq!(
+            sent[0].message,
+            format!("boom\nhttps://status.example.org/incidents/{id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_resolve_resets_the_machine() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        let c = check();
+
+        for t in 0..3 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let first = db::active_incidents(&pool).await.unwrap()[0].id;
+        assert_eq!(rec.count(), 1);
+
+        // Resolved by hand while the check still fails.
+        db::resolve_incident(&pool, first, 5).await.unwrap();
+
+        // No reminder about the closed incident, even past the interval...
+        feed(&mut engine, &pool, &c, false, Some("boom"), 200, false)
+            .await
+            .unwrap();
+        assert_eq!(rec.count(), 1);
+        assert!(db::active_incidents(&pool).await.unwrap().is_empty());
+
+        // ...and a failure that goes on opens a new incident.
+        for t in 201..203 {
+            feed(&mut engine, &pool, &c, false, Some("boom"), t, false)
+                .await
+                .unwrap();
+        }
+        let active = db::active_incidents(&pool).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_ne!(active[0].id, first);
+
+        // Recovery closes the new one and leaves the old one as it was.
+        for t in 300..302 {
+            feed(&mut engine, &pool, &c, true, None, t, false)
+                .await
+                .unwrap();
+        }
+        assert!(db::active_incidents(&pool).await.unwrap().is_empty());
+        let old = db::incident(&pool, first).await.unwrap().unwrap();
+        assert_eq!(old.resolved_at, Some(5));
+        assert_eq!(db::incident_updates(&pool, first).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_resumes_a_check_no_component_mirrors() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        // Filed under the check id, as the probe loop does without a component.
+        let id = db::create_incident(
+            &pool,
+            "c1",
+            "down",
+            State::MajorOutage,
+            IncidentState::Investigating,
+            true,
+            0,
+        )
+        .await
+        .unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        let cfg = Config {
+            checks: vec![check()],
+            ..Config::default()
+        };
+        engine.bootstrap(&pool, &cfg).await.unwrap();
+
+        let c = check();
+        for t in 1..=2 {
+            engine
+                .handle(
+                    &pool,
+                    AlertInput {
+                        component: "c1",
+                        check: &c,
+                        ok: true,
+                        message: None,
+                        now: t,
+                        muted: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let inc = db::incident(&pool, id).await.unwrap().unwrap();
+        assert!(inc.resolved_at.is_some());
+    }
+}
+
+/// Absolute link to an incident page under the configured public URL.
+pub fn incident_url(base: &str, id: i64) -> String {
+    format!("{}/incidents/{id}", base.trim_end_matches('/'))
 }
 
 fn sentence_case(text: &str) -> String {

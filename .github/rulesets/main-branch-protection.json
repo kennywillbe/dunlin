@@ -16,8 +16,8 @@
   "required_signatures": false,
   "required_status_checks": {
     "contexts": [
-      "fmt + clippy + tests (ubuntu-latest)",
-      "fmt + clippy + tests (macos-latest)",
+      "fmt + clippy + tests (linux)",
+      "fmt + clippy + tests (macos)",
       "minimum supported Rust version",
       "container image builds",
       "the title is a conventional commit"

@@ -14,6 +14,9 @@ use chrono_tz::Tz;
 /// it starts in, which moves at most 15 minutes of probes and drops none.
 pub const SLOT_SECS: i64 = 900;
 
+/// Days in the status page's tick strips and its 90-day uptime figure.
+pub const STRIP_DAYS: usize = 90;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Day {
     pub date: NaiveDate,

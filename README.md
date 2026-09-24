@@ -22,12 +22,15 @@ Licensed under MIT OR Apache-2.0.
   opened and resolved automatically, optional maintenance windows that mute
   notifications, Telegram and webhook notifiers, a daily summary.
 - **History**: raw per-minute samples for 7 days and hourly aggregates for
-  90 days by default; charts for host, containers and check latency.
+  90 days by default; probe results as long as the hourly aggregates, and at
+  least the 90 days the status page shows; charts for host, containers and
+  check latency.
 - **Web**: read pages are public by default; incidents and maintenance are
   managed on `/manage`, and every write action needs the password (argon2, per-IP login rate limit, CSRF check). `protect_read = true`
   puts the read pages behind the password too.
 - **Config** is a TOML file that is reloaded on change; an invalid new file is
-  logged and the running configuration is kept.
+  logged and the running configuration is kept. `listen`, `data_dir`,
+  `db_path` and `docker.socket` need a restart; a change to them is logged.
 
 ## Install (native binary + systemd)
 
@@ -60,9 +63,14 @@ and the system D-Bus socket are optional read-only mounts, and the database
 lives in a named volume.
 
 ```sh
-cp dunlin.example.toml dunlin.toml     # set proc_root = "/host/proc"
+cp dunlin.example.toml dunlin.toml     # set proc_root = "/host/proc" and listen = "0.0.0.0:8080"
 docker compose -f docker-compose.example.yml up -d
 ```
+
+Inside the container, `listen` has to be `0.0.0.0:8080` for the published port
+to reach dunlin, and a disk check's `mount` is a path in the container: mount
+the host filesystem you want measured (the compose file has a commented line
+for `/`) and point `mount` at it.
 
 ## Configuration
 
@@ -118,8 +126,10 @@ Create a heartbeat check with a `token`, then ping it when a job runs:
 curl -fsS -X POST https://dunlin.example.org/hb/<token>
 ```
 
-The check fails when no ping arrives within `period + grace`. Tokens are compared
-in constant time.
+The check fails when no ping arrives within `period + grace`. A check that has
+never been pinged gets the same time from when dunlin starts watching it, so a
+new nightly job is not reported down before its first night. Tokens are
+compared in constant time.
 
 ## Webhook payload
 
@@ -142,6 +152,7 @@ Each webhook notification is an HTTP `POST` with a JSON body. Any headers under
 - `state`: the component state at the time, one of `operational`, `degraded`,
   `partial_outage`, `major_outage`, `maintenance`.
 - `incident_id`: the incident the event belongs to, or `null` (daily summary).
+  With `public_url` set, `message` ends with a link to that incident's page.
 - `timestamp`: Unix seconds.
 
 ## CLI

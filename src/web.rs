@@ -210,9 +210,6 @@ async fn incident_views(
 /// How many days of history the status page lists, as on Statuspage.
 const PAST_DAYS: usize = 14;
 
-/// Window of the tick strips.
-const STRIP_DAYS: usize = 90;
-
 fn fmt_every(secs: u64) -> String {
     if secs < 120 || !secs.is_multiple_of(60) {
         format!("{secs} s")
@@ -263,7 +260,7 @@ async fn status_page(State(state): State<AppState>, jar: CookieJar) -> Response 
         .unwrap_or_default();
     let active = db::active_incidents(&state.pool).await.unwrap_or_default();
     let tz = cfg.tz();
-    let strip = crate::days::last_days(now, STRIP_DAYS, tz);
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, tz);
     let strip_from = strip.first().map_or(now, |d| d.start);
     let history = History {
         days: strip,
@@ -470,8 +467,10 @@ async fn build_component(
     let uptime_90 = (total > 0).then(|| format_pct(up as f64 / total as f64 * 100.0));
 
     let window = maintenance.iter().find(|m| m.covers(&comp.id, now));
-    let mine: Vec<&crate::models::Incident> =
-        active.iter().filter(|i| i.component == comp.id).collect();
+    let mine: Vec<&crate::models::Incident> = active
+        .iter()
+        .filter(|i| affects(&i.component, &comp.id))
+        .collect();
     let impact = mine.iter().map(|i| i.impact).max();
     let state = status::component_state(base, window.is_some(), impact);
     let since = mine.iter().map(|i| i.created_at).min();
@@ -518,7 +517,7 @@ async fn build_component(
     let incidents: Vec<&crate::models::Incident> = history
         .incidents
         .iter()
-        .filter(|i| i.component == comp.id)
+        .filter(|i| affects(&i.component, &comp.id))
         .collect();
     let windows: Vec<&crate::models::Maintenance> = history
         .maintenance
@@ -550,6 +549,12 @@ async fn build_component(
         }),
     };
     (view, snap)
+}
+
+/// Whether an incident filed against `target` counts for component `id`. An
+/// empty target is "All components", like an empty maintenance component.
+fn affects(target: &str, id: &str) -> bool {
+    target.is_empty() || target == id
 }
 
 /// Two decimals, but never round a day with downtime up to a clean 100%.
@@ -1095,14 +1100,24 @@ async fn manage_page(State(state): State<AppState>, jar: CookieJar) -> Response 
     })
 }
 
-async fn feed(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn feed(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar) -> Response {
+    // The feed carries incident titles and messages, so it is a read page too.
+    if let Some(r) = read_guard(&state, &jar).await {
+        return r;
+    }
     let cfg = state.cfg();
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost")
-        .to_string();
-    let base = format!("http://{host}");
+    // Feed readers keep these ids, so they should not depend on which Host
+    // header a request came in with when the public address is known.
+    let base = match &cfg.public_url {
+        Some(u) => u.trim_end_matches('/').to_string(),
+        None => {
+            let host = headers
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost");
+            format!("http://{host}")
+        }
+    };
     let incidents = db::recent_incidents(&state.pool, 20)
         .await
         .unwrap_or_default();
@@ -1554,6 +1569,9 @@ async fn resolve_incident(
     Redirect::to(&format!("/incidents/{id}")).into_response()
 }
 
+/// Longest maintenance window, and furthest start, that the form accepts.
+const MAX_MAINTENANCE_SECS: i64 = 366 * 86_400;
+
 #[derive(Deserialize)]
 struct MaintenanceForm {
     #[serde(default)]
@@ -1575,8 +1593,14 @@ async fn start_maintenance(
         return r;
     }
     let now = crate::now_ts();
-    let duration = form.duration_minutes.max(1) * 60;
-    let starts = now + form.starts_in_seconds.unwrap_or(0);
+    // Clamped so a typo cannot overflow the timestamps; a window longer than
+    // a year, or starting further out, is not a maintenance window.
+    let duration = form.duration_minutes.clamp(1, MAX_MAINTENANCE_SECS / 60) * 60;
+    let starts = now
+        + form
+            .starts_in_seconds
+            .unwrap_or(0)
+            .clamp(0, MAX_MAINTENANCE_SECS);
     if let Err(e) = db::create_maintenance(
         &state.pool,
         &form.component,
