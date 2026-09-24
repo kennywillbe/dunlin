@@ -45,13 +45,18 @@ impl LoginLimiter {
 }
 
 /// Client IP: the socket by default, proxy headers only when explicitly trusted.
+///
+/// A proxy appends the address it saw to `X-Forwarded-For`, after whatever the
+/// client sent, so only the last entry is trustworthy. Taking the first one let
+/// a client pick a fresh address per request and never hit the login limit.
+/// This assumes one proxy in front of dunlin, as the config documents.
 pub fn client_ip(headers: &HeaderMap, socket: Option<SocketAddr>, trusted_proxy: bool) -> String {
     if trusted_proxy {
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(first) = xff.split(',').next() {
-                let first = first.trim();
-                if !first.is_empty() {
-                    return first.to_string();
+            if let Some(last) = xff.rsplit(',').next() {
+                let last = last.trim();
+                if !last.is_empty() {
+                    return last.to_string();
                 }
             }
         }
@@ -144,7 +149,8 @@ mod tests {
         );
         let socket: Option<SocketAddr> = Some("127.0.0.1:5000".parse().unwrap());
         assert_eq!(client_ip(&headers, socket, false), "127.0.0.1");
-        assert_eq!(client_ip(&headers, socket, true), "9.9.9.9");
+        // 9.9.9.9 is what the client claimed; 1.1.1.1 is what our proxy saw.
+        assert_eq!(client_ip(&headers, socket, true), "1.1.1.1");
     }
 
     #[test]

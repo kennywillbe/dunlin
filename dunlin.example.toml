@@ -19,7 +19,8 @@ data_dir = "data"
 proc_root = "/proc"
 
 # Trust X-Forwarded-For / X-Real-IP for the client address. Only enable this
-# when dunlin is behind a reverse proxy you control.
+# when dunlin is behind exactly one reverse proxy you control: the last
+# X-Forwarded-For entry, the one that proxy appends, is taken as the client.
 # Default: false
 trusted_proxy = false
 
