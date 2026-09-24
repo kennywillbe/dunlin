@@ -81,3 +81,42 @@ fn check_config_accepts_valid_and_rejects_invalid() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("password_hash"), "{err}");
 }
+
+#[test]
+fn check_config_after_the_config_flag() {
+    // Used to start the server instead: the first argument was a flag, so
+    // the command was never looked at.
+    let hash = dunlin::auth::hash_password("correcthorsebattery").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("good.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "listen = \"127.0.0.1:8080\"\n[web]\npassword_hash = \"{hash}\"\n[systemd]\nenabled = false\n"
+        ),
+    )
+    .unwrap();
+    let out = bin()
+        .arg("--config")
+        .arg(&path)
+        .arg("check-config")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("is valid"));
+}
+
+#[test]
+fn no_arguments_runs_the_server_with_dunlin_toml() {
+    // In an empty directory the server fails to find its default config,
+    // which shows it tried to start rather than printing the help.
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin().current_dir(dir.path()).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("dunlin.toml"), "{err}");
+}
