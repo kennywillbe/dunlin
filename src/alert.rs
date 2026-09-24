@@ -124,15 +124,16 @@ impl AlertEngine {
         &self.machines
     }
 
-    /// Rebuild machines for checks that already have an open incident.
+    /// Rebuild machines for checks that already have an open incident. Walks
+    /// the checks rather than the components: a check no component mirrors
+    /// files its incidents under its own id, and skipping it left such an
+    /// incident open forever once the check recovered after a restart.
     pub async fn bootstrap(&mut self, pool: &Pool, cfg: &Config) -> Result<()> {
-        for component in &cfg.components {
-            let Some(check_id) = component.check.as_ref().filter(|c| !c.is_empty()) else {
-                continue;
-            };
-            if let Some(incident) = db::active_incident_for(pool, &component.id).await? {
+        for check in &cfg.checks {
+            let component = cfg.incident_component(&check.id);
+            if let Some(incident) = db::active_incident_for(pool, &component).await? {
                 self.machines
-                    .insert(check_id.clone(), CheckMachine::resumed(incident.id));
+                    .insert(check.id.clone(), CheckMachine::resumed(incident.id));
             }
         }
         Ok(())
@@ -429,6 +430,7 @@ mod tests {
                 check: Some("c1".into()),
                 description: None,
             }],
+            checks: vec![check()],
             ..Config::default()
         };
         engine.bootstrap(&pool, &cfg).await.unwrap();
@@ -443,6 +445,50 @@ mod tests {
         let inc = db::incident(&pool, id).await.unwrap().unwrap();
         assert!(inc.resolved_at.is_some());
         assert_eq!(rec.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_resumes_a_check_no_component_mirrors() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        // Filed under the check id, as the probe loop does without a component.
+        let id = db::create_incident(
+            &pool,
+            "c1",
+            "down",
+            State::MajorOutage,
+            IncidentState::Investigating,
+            true,
+            0,
+        )
+        .await
+        .unwrap();
+        let rec = RecordingNotifier::new();
+        let mut engine = engine_with(&rec).await;
+        let cfg = Config {
+            checks: vec![check()],
+            ..Config::default()
+        };
+        engine.bootstrap(&pool, &cfg).await.unwrap();
+
+        let c = check();
+        for t in 1..=2 {
+            engine
+                .handle(
+                    &pool,
+                    AlertInput {
+                        component: "c1",
+                        check: &c,
+                        ok: true,
+                        message: None,
+                        now: t,
+                        muted: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let inc = db::incident(&pool, id).await.unwrap().unwrap();
+        assert!(inc.resolved_at.is_some());
     }
 }
 

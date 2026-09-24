@@ -507,6 +507,16 @@ impl Config {
         self.components.iter().find(|c| c.id == id)
     }
 
+    /// The component a check's incidents are filed under: the one that mirrors
+    /// it, or the check id itself when no component does.
+    pub fn incident_component(&self, check_id: &str) -> String {
+        self.components
+            .iter()
+            .find(|c| c.check.as_deref() == Some(check_id))
+            .map(|c| c.id.clone())
+            .unwrap_or_else(|| check_id.to_string())
+    }
+
     /// Falls back to UTC only for a config that skipped `validate`.
     pub fn tz(&self) -> chrono_tz::Tz {
         self.timezone.parse().unwrap_or(chrono_tz::Tz::UTC)
