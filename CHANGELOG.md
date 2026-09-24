@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/kennywillbe/dunlin/compare/v0.2.0...v0.3.0) (2026-09-24)
+
+
+### Features
+
+* add notifier channels, badges, Prometheus, API and subscriptions ([#16](https://github.com/kennywillbe/dunlin/issues/16)) ([df1d935](https://github.com/kennywillbe/dunlin/commit/df1d935b8ad08b2f353b47a61ed9f36b5e10134d))
+
 ## [0.2.0](https://github.com/kennywillbe/dunlin/compare/v0.1.0...v0.2.0) (2026-09-24)
 
 
