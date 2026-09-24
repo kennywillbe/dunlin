@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(status_page))
         .route("/metrics", get(metrics_page))
+        .route("/metrics/prometheus", get(prometheus))
         .route("/api/metrics", get(api_metrics))
         .route("/incidents", get(incidents_page))
         .route("/incidents/{id}", get(incident_page))
@@ -1339,6 +1340,171 @@ async fn uptime_badge(
         color,
     };
     badge_response(StatusCode::OK, BadgeFormat::Svg, &badge)
+}
+
+/// Newest sample a scrape still exports. The collector writes every 60 s, so
+/// three missed rounds mean the source (a removed container, a stopped
+/// collector) is gone rather than late.
+const SCRAPE_FRESH_SECS: i64 = 180;
+
+/// Access check for the Prometheus endpoint. Scrapers send no session cookie
+/// either, so this goes through the same hook that API keys will use.
+async fn scrape_guard(state: &AppState, jar: &CookieJar) -> Option<Response> {
+    badge_guard(state, jar).await
+}
+
+/// `/metrics/prometheus`: current checks, components, host and containers.
+async fn prometheus(State(state): State<AppState>, jar: CookieJar) -> Response {
+    use crate::prometheus::Family;
+
+    if let Some(r) = scrape_guard(&state, &jar).await {
+        return r;
+    }
+    let cfg = state.cfg();
+    let now = crate::now_ts();
+    let fresh_from = now - SCRAPE_FRESH_SECS;
+    let (host, containers, active, windows) = match tokio::try_join!(
+        db::latest_samples_since(&state.pool, "host", fresh_from),
+        db::latest_samples_since(&state.pool, "container", fresh_from),
+        db::active_incidents(&state.pool),
+        db::current_and_upcoming_maintenance(&state.pool, now),
+    ) {
+        Ok(v) => v,
+        Err(e) => return internal(&state, e),
+    };
+
+    let mut up = Family::gauge(
+        "dunlin_check_up",
+        "Whether the latest probe of the check passed (1) or failed (0).",
+    );
+    let mut latency = Family::gauge(
+        "dunlin_check_latency_seconds",
+        "Latency of the latest probe of the check.",
+    );
+    for check in &cfg.checks {
+        let last = match db::last_check_result(&state.pool, &check.id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(e) => return internal(&state, e),
+        };
+        let labels = vec![("check", check.id.clone())];
+        up.push(labels.clone(), if last.ok { 1.0 } else { 0.0 });
+        if let Some(ms) = last.latency_ms {
+            latency.push(labels, ms / 1000.0);
+        }
+    }
+
+    let mut comp_state = Family::gauge(
+        "dunlin_component_state",
+        "Current state of the component as on the status page: 1 for its state, 0 for the others.",
+    );
+    let strip = crate::days::last_days(now, crate::days::STRIP_DAYS, cfg.tz());
+    let from = strip.first().map_or(now, |d| d.start);
+    for comp in &cfg.components {
+        let current = component_now(&state.pool, &cfg, comp, &windows, &active, from, now)
+            .await
+            .state;
+        for s in [
+            CompState::Operational,
+            CompState::Degraded,
+            CompState::PartialOutage,
+            CompState::MajorOutage,
+            CompState::Maintenance,
+        ] {
+            comp_state.push(
+                vec![
+                    ("component", comp.id.clone()),
+                    ("state", s.as_str().to_string()),
+                ],
+                if s == current { 1.0 } else { 0.0 },
+            );
+        }
+    }
+
+    let mut incidents = Family::gauge("dunlin_incidents_open", "Number of open incidents.");
+    incidents.push(vec![], active.len() as f64);
+
+    let pct = |v: f64| v / 100.0;
+    let mut cpu = Family::gauge("dunlin_host_cpu_usage_ratio", "Host CPU busy time, 0 to 1.");
+    let mut mem = Family::gauge(
+        "dunlin_host_memory_used_ratio",
+        "Host memory in use, 0 to 1.",
+    );
+    let mut swap = Family::gauge("dunlin_host_swap_used_ratio", "Host swap in use, 0 to 1.");
+    let mut load1 = Family::gauge("dunlin_host_load1", "Host load average over 1 minute.");
+    let mut load5 = Family::gauge("dunlin_host_load5", "Host load average over 5 minutes.");
+    let mut load15 = Family::gauge("dunlin_host_load15", "Host load average over 15 minutes.");
+    let mut disk = Family::gauge(
+        "dunlin_host_disk_used_ratio",
+        "Space in use on a mount watched by a disk check, 0 to 1.",
+    );
+    let mut rx = Family::gauge(
+        "dunlin_host_network_receive_bytes_per_second",
+        "Host network bytes received per second.",
+    );
+    let mut tx = Family::gauge(
+        "dunlin_host_network_transmit_bytes_per_second",
+        "Host network bytes sent per second.",
+    );
+    for (metric, key, value) in host {
+        match metric.as_str() {
+            "cpu_pct" => cpu.push(vec![], pct(value)),
+            "mem_pct" => mem.push(vec![], pct(value)),
+            "swap_pct" => swap.push(vec![], pct(value)),
+            "load1" => load1.push(vec![], value),
+            "load5" => load5.push(vec![], value),
+            "load15" => load15.push(vec![], value),
+            "disk_used_pct" => disk.push(vec![("mount", key)], pct(value)),
+            "net_rx_bps" => rx.push(vec![], value),
+            "net_tx_bps" => tx.push(vec![], value),
+            _ => {}
+        }
+    }
+
+    let mut c_cpu = Family::gauge(
+        "dunlin_container_cpu_usage_ratio",
+        "Container CPU use; 1 is one full core.",
+    );
+    let mut c_mem = Family::gauge("dunlin_container_memory_bytes", "Container memory in use.");
+    let mut c_run = Family::gauge(
+        "dunlin_container_running",
+        "Whether the container is running (1) or not (0).",
+    );
+    for (metric, key, value) in containers {
+        let labels = vec![("container", key)];
+        match metric.as_str() {
+            "cpu_pct" => c_cpu.push(labels, pct(value)),
+            "mem_bytes" => c_mem.push(labels, value),
+            "running" => c_run.push(labels, value),
+            _ => {}
+        }
+    }
+
+    let mut build = Family::gauge(
+        "dunlin_build_info",
+        "Always 1; the version is in the label.",
+    );
+    build.push(
+        vec![("version", env!("CARGO_PKG_VERSION").to_string())],
+        1.0,
+    );
+
+    let body = crate::prometheus::render(&[
+        up, latency, comp_state, incidents, cpu, mem, swap, load1, load5, load15, disk, rx, tx,
+        c_cpu, c_mem, c_run, build,
+    ]);
+    (
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static(crate::prometheus::CONTENT_TYPE),
+            ),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            NOSNIFF,
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn asset(State(state): State<AppState>, Path(file): Path<String>) -> Response {

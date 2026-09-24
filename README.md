@@ -25,7 +25,7 @@ Licensed under MIT OR Apache-2.0.
 - **History**: raw per-minute samples for 7 days and hourly aggregates for
   90 days by default; probe results as long as the hourly aggregates, and at
   least the 90 days the status page shows; charts for host, containers and
-  check latency.
+  check latency; a Prometheus endpoint with the current values.
 - **Web**: read pages are public by default; incidents and maintenance are
   managed on `/manage`, and every write action needs the password (argon2, per-IP login rate limit, CSRF check). `protect_read = true`
   puts the read pages behind the password too.
@@ -190,6 +190,41 @@ state and 90-day uptime as the status page:
 
 `<component>` is the component `id`. With `protect_read = true` badges need a
 logged-in session, like every other read page.
+
+## Prometheus
+
+`/metrics/prometheus` serves the current values in the Prometheus text format.
+It is public unless `protect_read = true`, in which case it needs a logged-in
+session like the other read pages.
+
+```yaml
+scrape_configs:
+  - job_name: dunlin
+    metrics_path: /metrics/prometheus
+    static_configs:
+      - targets: ["status.example.org:8080"]
+```
+
+All metrics are gauges in base units (seconds, bytes, ratios from 0 to 1):
+
+- `dunlin_check_up{check}`, `dunlin_check_latency_seconds{check}`: the latest
+  probe; a check with no result yet is left out.
+- `dunlin_component_state{component,state}`: 1 for the state the status page
+  shows, 0 for the other four.
+- `dunlin_incidents_open`
+- `dunlin_host_cpu_usage_ratio`, `dunlin_host_memory_used_ratio`,
+  `dunlin_host_swap_used_ratio`, `dunlin_host_load1`, `dunlin_host_load5`,
+  `dunlin_host_load15`, `dunlin_host_disk_used_ratio{mount}`,
+  `dunlin_host_network_receive_bytes_per_second`,
+  `dunlin_host_network_transmit_bytes_per_second`
+- `dunlin_container_cpu_usage_ratio{container}` (1 is one full core),
+  `dunlin_container_memory_bytes{container}`,
+  `dunlin_container_running{container}`
+- `dunlin_build_info{version}`
+
+Host and container values older than 3 minutes (three collector rounds) are
+left out, so a removed container or a stalled collector shows as missing
+rather than frozen.
 
 ## CLI
 

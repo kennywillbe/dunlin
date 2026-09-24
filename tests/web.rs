@@ -1127,3 +1127,223 @@ async fn protect_read_locks_badges() {
         assert_eq!(status, StatusCode::OK, "{uri}");
     }
 }
+
+fn sample(ts: i64, scope: &str, metric: &str, key: &str, value: f64) -> dunlin::models::Sample {
+    dunlin::models::Sample {
+        ts,
+        scope: scope.into(),
+        metric: metric.into(),
+        key: key.into(),
+        value,
+    }
+}
+
+/// Every line is a comment or `name{labels} value` with a numeric value.
+fn assert_exposition_parses(body: &str) {
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("# ") {
+            assert!(
+                rest.starts_with("HELP dunlin_") || rest.starts_with("TYPE dunlin_"),
+                "bad comment: {line}"
+            );
+            continue;
+        }
+        let (series, value) = line.rsplit_once(' ').expect(line);
+        assert!(
+            value.parse::<f64>().is_ok() || ["+Inf", "-Inf", "NaN"].contains(&value),
+            "bad value: {line}"
+        );
+        let (name, labels) = match series.split_once('{') {
+            Some((n, rest)) => (n, Some(rest.strip_suffix('}').expect(line))),
+            None => (series, None),
+        };
+        assert!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':'),
+            "bad name: {line}"
+        );
+        let Some(mut rest) = labels else { continue };
+        // Walk `key="value"` pairs, honouring backslash escapes in values.
+        while !rest.is_empty() {
+            let (key, after) = rest.split_once("=\"").expect(line);
+            assert!(
+                key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "bad label name: {line}"
+            );
+            let mut chars = after.char_indices();
+            let end = loop {
+                match chars.next().expect(line) {
+                    (_, '\\') => {
+                        let (_, esc) = chars.next().expect(line);
+                        assert!(matches!(esc, '\\' | '"' | 'n'), "bad escape: {line}");
+                    }
+                    (i, '"') => break i,
+                    (_, c) => assert_ne!(c, '\n'),
+                }
+            };
+            rest = &after[end + 1..];
+            rest = rest.strip_prefix(',').unwrap_or(rest);
+        }
+    }
+}
+
+#[tokio::test]
+async fn prometheus_exports_current_values() {
+    let (state, pool) = state(false).await;
+    let now = dunlin::now_ts();
+    db::insert_check_result(
+        &pool,
+        &dunlin::models::CheckResult {
+            ts: now - 30,
+            check_id: "c1".into(),
+            ok: true,
+            degraded: false,
+            latency_ms: Some(250.0),
+            message: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::create_incident(
+        &pool,
+        "web",
+        "Slow",
+        dunlin::models::State::Degraded,
+        dunlin::models::IncidentState::Investigating,
+        false,
+        now - 60,
+    )
+    .await
+    .unwrap();
+    db::insert_samples(
+        &pool,
+        &[
+            sample(now - 3600, "host", "cpu_pct", "", 90.0),
+            sample(now - 30, "host", "cpu_pct", "", 25.0),
+            sample(now - 30, "host", "mem_pct", "", 50.0),
+            sample(now - 30, "host", "load1", "", 0.75),
+            sample(now - 30, "host", "disk_used_pct", "/", 12.5),
+            sample(now - 30, "host", "net_rx_bps", "", 2048.0),
+            // Stale: the collector stopped writing it a while ago.
+            sample(now - 3600, "host", "swap_pct", "", 10.0),
+            sample(now - 30, "container", "cpu_pct", "api", 150.0),
+            sample(now - 30, "container", "mem_bytes", "api", 1048576.0),
+            sample(now - 30, "container", "running", "api", 1.0),
+            // A container removed an hour ago must disappear.
+            sample(now - 3600, "container", "running", "gone", 1.0),
+            sample(now - 30, "container", "running", "we\"ird\\name", 0.0),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let (status, headers, body) = send(app(state), get("/metrics/prometheus")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers[CONTENT_TYPE],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_exposition_parses(&body);
+
+    for family in [
+        "dunlin_check_up",
+        "dunlin_check_latency_seconds",
+        "dunlin_component_state",
+        "dunlin_incidents_open",
+        "dunlin_host_cpu_usage_ratio",
+        "dunlin_host_memory_used_ratio",
+        "dunlin_host_swap_used_ratio",
+        "dunlin_host_load1",
+        "dunlin_host_load5",
+        "dunlin_host_load15",
+        "dunlin_host_disk_used_ratio",
+        "dunlin_host_network_receive_bytes_per_second",
+        "dunlin_host_network_transmit_bytes_per_second",
+        "dunlin_container_cpu_usage_ratio",
+        "dunlin_container_memory_bytes",
+        "dunlin_container_running",
+        "dunlin_build_info",
+    ] {
+        assert!(
+            body.contains(&format!("\n# HELP {family} "))
+                || body.starts_with(&format!("# HELP {family} ")),
+            "{family}\n{body}"
+        );
+        assert!(
+            body.contains(&format!("# TYPE {family} gauge\n")),
+            "{family}\n{body}"
+        );
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    for want in [
+        "dunlin_check_up{check=\"c1\"} 1",
+        "dunlin_check_latency_seconds{check=\"c1\"} 0.25",
+        "dunlin_component_state{component=\"web\",state=\"degraded\"} 1",
+        "dunlin_component_state{component=\"web\",state=\"operational\"} 0",
+        "dunlin_incidents_open 1",
+        "dunlin_host_cpu_usage_ratio 0.25",
+        "dunlin_host_memory_used_ratio 0.5",
+        "dunlin_host_load1 0.75",
+        "dunlin_host_disk_used_ratio{mount=\"/\"} 0.125",
+        "dunlin_host_network_receive_bytes_per_second 2048",
+        "dunlin_container_cpu_usage_ratio{container=\"api\"} 1.5",
+        "dunlin_container_memory_bytes{container=\"api\"} 1048576",
+        "dunlin_container_running{container=\"api\"} 1",
+        "dunlin_container_running{container=\"we\\\"ird\\\\name\"} 0",
+        &format!(
+            "dunlin_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        ),
+    ] {
+        assert!(lines.contains(&want), "missing {want}\n{body}");
+    }
+    // The heartbeat has never reported, and stale samples are left out.
+    assert!(!body.contains("check=\"hb\""), "{body}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("dunlin_host_swap_used_ratio")),
+        "{body}"
+    );
+    assert!(!body.contains("gone"), "{body}");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("dunlin_component_state{component=\"web\""))
+            .count(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn prometheus_label_values_are_escaped() {
+    let extra = "[[components]]\nid = 'a\"b\\c'\nname = \"Odd\"\n";
+    let (state, _pool) =
+        state_from(test_config_with(false, extra, std::path::Path::new("."))).await;
+    let (status, _, body) = send(app(state), get("/metrics/prometheus")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_exposition_parses(&body);
+    assert!(
+        body.contains("dunlin_component_state{component=\"a\\\"b\\\\c\",state=\"operational\"} 1"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn protect_read_locks_prometheus() {
+    let (state, _pool) = state(true).await;
+    let app = app(state);
+    let (status, headers, _) = send(app.clone(), get("/metrics/prometheus")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/login");
+
+    let cookie = login(&app).await;
+    let mut req = get("/metrics/prometheus");
+    req.headers_mut().insert(COOKIE, cookie.parse().unwrap());
+    let (status, _, body) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("# TYPE dunlin_build_info gauge"));
+}
