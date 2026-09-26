@@ -40,8 +40,8 @@ Pull requests are squash-merged, so the pull request title becomes the commit
 subject on `main`, and release-please turns it into the changelog line and the
 next version. The title has to be a
 [Conventional Commit](https://www.conventionalcommits.org/): `feat:`, `fix:`,
-`docs:`, `chore:`, and `feat!:` for anything that breaks an existing config or
-database. A check fails the pull request if it does not parse.
+`perf:`, `docs:`, `chore:`, and `feat!:` for anything that breaks an existing
+config or database. A check fails the pull request if it does not parse.
 
 Fill in [the pull request template](.github/pull_request_template.md). The web
 UI does that for you; `gh pr create` does not.
