@@ -21,6 +21,10 @@
       "section": "Bug Fixes"
     },
     {
+      "type": "perf",
+      "section": "Performance"
+    },
+    {
       "type": "build",
       "section": "Dependencies",
       "hidden": false
