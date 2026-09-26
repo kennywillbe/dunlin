@@ -31,6 +31,7 @@ pub async fn run_once(pool: &Pool, now: i64, raw_days: u32, hourly_days: u32) ->
     }
 
     db::prune_samples_before(pool, now - raw_days as i64 * 86_400).await?;
+    db::prune_series_before(pool, now - raw_days as i64 * 86_400).await?;
     db::prune_hourly_before(pool, now - hourly_days as i64 * 86_400).await?;
     db::prune_check_results_before(pool, now - result_days(hourly_days) * 86_400).await?;
     db::prune_sessions(pool, now).await?;
@@ -151,5 +152,58 @@ mod tests {
             .await
             .unwrap();
         assert!(h.is_empty());
+    }
+
+    #[tokio::test]
+    async fn series_rows_track_and_prune_with_their_samples() {
+        let pool = db::connect_memory().await.unwrap();
+        let now: i64 = 300 * 86_400;
+
+        // A current series and one whose only sample is past raw retention.
+        db::insert_samples(&pool, &[sample(now - 60, 1.0)])
+            .await
+            .unwrap();
+        db::insert_samples(
+            &pool,
+            &[Sample {
+                ts: now - 10 * 86_400,
+                scope: "host".into(),
+                metric: "gone".into(),
+                key: String::new(),
+                value: 1.0,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let ids = db::distinct_series(&pool).await.unwrap();
+        assert!(ids.contains(&("host".into(), "cpu_pct".into(), String::new())));
+        assert!(ids.contains(&("host".into(), "gone".into(), String::new())));
+
+        run_once(&pool, now, 7, 90).await.unwrap();
+
+        let ids = db::distinct_series(&pool).await.unwrap();
+        assert!(ids.contains(&("host".into(), "cpu_pct".into(), String::new())));
+        assert!(
+            !ids.contains(&("host".into(), "gone".into(), String::new())),
+            "a series whose raw rows were pruned must leave the picker: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_picker_reads_the_series_table_not_samples() {
+        let pool = db::connect_memory().await.unwrap();
+        db::insert_samples(&pool, &[sample(1, 1.0)]).await.unwrap();
+        // The old picker scanned `samples`; the new one reads `series`, which
+        // only the rollup prunes. Dropping the raw rows directly leaves it
+        // visible, so this fails if `distinct_series` goes back to `samples`.
+        sqlx::query("DELETE FROM samples")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            db::distinct_series(&pool).await.unwrap(),
+            vec![("host".into(), "cpu_pct".into(), String::new())]
+        );
     }
 }

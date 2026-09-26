@@ -69,6 +69,19 @@ pub async fn insert_samples(pool: &Pool, samples: &[Sample]) -> Result<()> {
         .bind(s.value)
         .execute(pool)
         .await?;
+        // Keep the series rows in step with the raw ones. `MAX` absorbs an
+        // out-of-order insert (a rollup catching up after a restart), so
+        // `last_ts` is the newest sample of the series, not the last written.
+        sqlx::query(
+            "INSERT INTO series (scope, metric, key, last_ts) VALUES (?, ?, ?, ?)
+             ON CONFLICT(scope, metric, key) DO UPDATE SET last_ts = MAX(last_ts, excluded.last_ts)",
+        )
+        .bind(&s.scope)
+        .bind(&s.metric)
+        .bind(&s.key)
+        .bind(s.ts)
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
@@ -187,6 +200,16 @@ pub async fn rollup_range(pool: &Pool, from: i64, to: i64) -> Result<u64> {
 
 pub async fn prune_samples_before(pool: &Pool, cutoff: i64) -> Result<u64> {
     let res = sqlx::query("DELETE FROM samples WHERE ts < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Drop series rows whose newest raw sample has been pruned, so the picker does
+/// not offer a series the charts can no longer fill.
+pub async fn prune_series_before(pool: &Pool, cutoff: i64) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM series WHERE last_ts < ?")
         .bind(cutoff)
         .execute(pool)
         .await?;
@@ -316,12 +339,13 @@ pub async fn consecutive_failures(pool: &Pool, check_id: &str, limit: i64) -> Re
     Ok(count)
 }
 
-/// Distinct series present in the raw samples table, for the metrics picker.
+/// Distinct series present in the series table, for the metrics picker. Reads
+/// `series`, which `insert_samples` keeps in step and the rollup prunes to the
+/// raw window, so this never scans `samples`.
 pub async fn distinct_series(pool: &Pool) -> Result<Vec<(String, String, String)>> {
-    let rows =
-        sqlx::query("SELECT DISTINCT scope, metric, key FROM samples ORDER BY scope, metric, key")
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query("SELECT scope, metric, key FROM series ORDER BY scope, metric, key")
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|r| (r.get("scope"), r.get("metric"), r.get("key")))
