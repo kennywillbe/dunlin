@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/kennywillbe/dunlin/compare/v0.3.0...v0.3.1) (2026-09-26)
+
+
+### Performance
+
+* read the metrics picker from a series table, not a scan of samples ([#18](https://github.com/kennywillbe/dunlin/issues/18)) ([ea4913f](https://github.com/kennywillbe/dunlin/commit/ea4913f34717ad6cf3e34f4b5b6f11ef04978a45))
+
 ## [0.3.0](https://github.com/kennywillbe/dunlin/compare/v0.2.0...v0.3.0) (2026-09-24)
 
 
