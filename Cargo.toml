@@ -50,7 +50,7 @@ url = "2"
 x509-parser = "0.16"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["fs"] }
+nix = { version = "0.31", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
