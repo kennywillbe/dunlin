@@ -24,7 +24,7 @@ askama = "0.16"
 async-trait = "0.1"
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["cookie"] }
-bollard = "0.18"
+bollard = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 futures-util = "0.3"
