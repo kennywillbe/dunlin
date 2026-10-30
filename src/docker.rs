@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use bollard::models::{ContainerCpuStats, ContainerStatsResponse, ContainerSummaryStateEnum};
 
 use crate::models::Sample;
 
@@ -103,24 +104,24 @@ pub fn cpu_percent(cur: CpuCounters, prev: Option<CpuCounters>, cpus: u64) -> f6
     (cpu_delta / sys_delta) * cpus.max(1) as f64 * 100.0
 }
 
-fn counters(stats: &bollard::container::CPUStats) -> CpuCounters {
+fn counters(stats: Option<&ContainerCpuStats>) -> CpuCounters {
     CpuCounters {
-        container: stats.cpu_usage.total_usage,
-        system: stats.system_cpu_usage.unwrap_or(0),
+        container: stats
+            .and_then(|s| s.cpu_usage.as_ref())
+            .and_then(|u| u.total_usage)
+            .unwrap_or(0),
+        system: stats.and_then(|s| s.system_cpu_usage).unwrap_or(0),
     }
 }
 
-fn online_cpus(stats: &bollard::container::Stats) -> u64 {
-    stats
-        .cpu_stats
-        .online_cpus
+fn online_cpus(stats: &ContainerStatsResponse) -> u64 {
+    let cpu = stats.cpu_stats.as_ref();
+    cpu.and_then(|c| c.online_cpus)
         .filter(|n| *n > 0)
+        .map(u64::from)
         .or_else(|| {
-            stats
-                .cpu_stats
-                .cpu_usage
-                .percpu_usage
-                .as_ref()
+            cpu.and_then(|c| c.cpu_usage.as_ref())
+                .and_then(|u| u.percpu_usage.as_ref())
                 .map(|v| v.len() as u64)
         })
         .unwrap_or(1)
@@ -129,15 +130,12 @@ fn online_cpus(stats: &bollard::container::Stats) -> u64 {
 #[async_trait]
 impl DockerSource for BollardDocker {
     async fn containers(&self) -> Result<Vec<ContainerStat>> {
-        use bollard::container::{ListContainersOptions, StatsOptions};
+        use bollard::query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder};
         use futures_util::StreamExt;
 
         let summaries = self
             .docker
-            .list_containers(Some(ListContainersOptions::<String> {
-                all: true,
-                ..Default::default()
-            }))
+            .list_containers(Some(ListContainersOptionsBuilder::new().all(true).build()))
             .await
             .context("listing containers")?;
 
@@ -173,15 +171,21 @@ impl DockerSource for BollardDocker {
                         i.restart_count.unwrap_or(0),
                     )
                 }
-                None => (summary.state.as_deref() == Some("running"), None, 0),
+                None => (
+                    summary.state == Some(ContainerSummaryStateEnum::RUNNING),
+                    None,
+                    0,
+                ),
             };
 
             let mut stats = self.docker.stats(
                 &id,
-                Some(StatsOptions {
-                    stream: false,
-                    one_shot: true,
-                }),
+                Some(
+                    StatsOptionsBuilder::new()
+                        .stream(false)
+                        .one_shot(true)
+                        .build(),
+                ),
             );
             let stat = match stats.next().await {
                 Some(Ok(s)) => s,
@@ -189,8 +193,8 @@ impl DockerSource for BollardDocker {
             };
 
             // Docker's own previous reading when it sent one, else ours.
-            let cur = counters(&stat.cpu_stats);
-            let prev = Some(counters(&stat.precpu_stats))
+            let cur = counters(stat.cpu_stats.as_ref());
+            let prev = Some(counters(stat.precpu_stats.as_ref()))
                 .filter(|p| p.system > 0)
                 .or_else(|| self.last_cpu.lock().unwrap().get(&id).copied());
             self.last_cpu.lock().unwrap().insert(id.clone(), cur);
@@ -201,8 +205,16 @@ impl DockerSource for BollardDocker {
                 running,
                 health,
                 cpu_pct,
-                mem_bytes: stat.memory_stats.usage.unwrap_or(0),
-                mem_limit_bytes: stat.memory_stats.limit.unwrap_or(0),
+                mem_bytes: stat
+                    .memory_stats
+                    .as_ref()
+                    .and_then(|m| m.usage)
+                    .unwrap_or(0),
+                mem_limit_bytes: stat
+                    .memory_stats
+                    .as_ref()
+                    .and_then(|m| m.limit)
+                    .unwrap_or(0),
                 restart_count,
             });
         }
@@ -225,6 +237,46 @@ mod tests {
         assert!((pct - 20.0).abs() < 1e-9, "{pct}");
         // Counters that went backwards (container restarted) read as idle.
         assert_eq!(cpu_percent(at(10, 12_000), Some(at(500, 11_000)), 4), 0.0);
+    }
+
+    // Since bollard 0.19 every stats field is optional; a daemon that leaves
+    // one out has to read as "no reading", not abort the whole snapshot.
+    #[test]
+    fn missing_stats_fields_read_as_no_reading() {
+        use bollard::models::ContainerCpuUsage;
+
+        assert_eq!(
+            counters(None),
+            CpuCounters {
+                container: 0,
+                system: 0
+            }
+        );
+        assert_eq!(online_cpus(&ContainerStatsResponse::default()), 1);
+
+        let cpu = ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage {
+                total_usage: Some(500),
+                percpu_usage: Some(vec![1, 2, 3]),
+                ..Default::default()
+            }),
+            system_cpu_usage: Some(10_000),
+            online_cpus: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            counters(Some(&cpu)),
+            CpuCounters {
+                container: 500,
+                system: 10_000
+            }
+        );
+        let stats = ContainerStatsResponse {
+            cpu_stats: Some(cpu),
+            ..Default::default()
+        };
+        // online_cpus of 0 means "not reported", so the per-CPU list decides.
+        assert_eq!(online_cpus(&stats), 3);
     }
 
     #[test]
