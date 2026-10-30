@@ -20,7 +20,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 argon2 = "0.6"
-askama = "0.16"
+# the default "config" feature exists only to read askama.toml, which this crate
+# does not use, and it pulls in the unmaintained basic-toml
+askama = { version = "0.16", default-features = false, features = ["derive", "std", "urlencode"] }
 async-trait = "0.1"
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["cookie"] }

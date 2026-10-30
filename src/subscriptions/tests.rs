@@ -46,6 +46,9 @@ impl SubscriberChannel for Fake {
         self.pacing
     }
     async fn send(&self, delivery: &Delivery) -> anyhow::Result<()> {
+        // `try_update`, the replacement, is stable only from Rust 1.95, and the
+        // MSRV is 1.94; switch to it when rust-version moves past 1.94.
+        #[allow(deprecated)]
         if self
             .fail
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
