@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.2](https://github.com/kennywillbe/dunlin/compare/v0.3.1...v0.3.2) (2026-10-30)
+
+
+### Bug Fixes
+
+* **deps:** bump bollard from 0.18.1 to 0.21.1 ([#33](https://github.com/kennywillbe/dunlin/issues/33)) ([af6538d](https://github.com/kennywillbe/dunlin/commit/af6538d419c595a728bcb821e08b28e97bc22c51))
+* **deps:** bump nix from 0.30.1 to 0.31.3 ([#24](https://github.com/kennywillbe/dunlin/issues/24)) ([088b476](https://github.com/kennywillbe/dunlin/commit/088b476343e57b0a3db66796a6e11ceac237af85))
+* **deps:** bump the patch-updates group across 1 directory with 4 updates ([#32](https://github.com/kennywillbe/dunlin/issues/32)) ([4dc163c](https://github.com/kennywillbe/dunlin/commit/4dc163ccb6d68dc584e6f66e111310ef958564c1))
+* **deps:** bump toml from 0.8.23 to 1.1.6+spec-1.1.0 ([#22](https://github.com/kennywillbe/dunlin/issues/22)) ([8cba039](https://github.com/kennywillbe/dunlin/commit/8cba0393443d6defd5d355ecbbfce114e13c8027))
+* **deps:** bump x509-parser from 0.16.0 to 0.18.1 ([#23](https://github.com/kennywillbe/dunlin/issues/23)) ([3fc8793](https://github.com/kennywillbe/dunlin/commit/3fc87931f3b56f3e451ff1b994979f56aede7624))
+* **deps:** clear the clippy and audit failures on current stable ([#31](https://github.com/kennywillbe/dunlin/issues/31)) ([409034c](https://github.com/kennywillbe/dunlin/commit/409034c67e66ec65a9b0ae000c5b4770e8ed5c94))
+
+
+### Dependencies
+
+* **deps:** bump taiki-e/install-action from 2.87.17 to 2.87.32 ([#25](https://github.com/kennywillbe/dunlin/issues/25)) ([7bd65cc](https://github.com/kennywillbe/dunlin/commit/7bd65cc6b136721d208ff3e239f08f12e1db0e8f))
+
 ## [0.3.1](https://github.com/kennywillbe/dunlin/compare/v0.3.0...v0.3.1) (2026-09-26)
 
 
