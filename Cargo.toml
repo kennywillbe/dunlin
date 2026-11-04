@@ -55,7 +55,7 @@ x509-parser = "0.18"
 nix = { version = "0.31", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "5"
+zbus = "6"
 
 [dev-dependencies]
 tempfile = "3"
